@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: news-first-quant-api
+    env: python
+    plan: starter
+    buildCommand: pip install -r mobile_stock_app/backend-requirements.txt
+    startCommand: python mobile_stock_app/server.py
+    envVars:
+      - key: FINBERT_DOWNLOAD
+        value: "0"
+      - key: CORS_ORIGIN
+        value: "*"

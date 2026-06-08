@@ -1,0 +1,6 @@
+feedparser
+yfinance
+pandas
+numpy
+requests
+matplotlib

@@ -1,0 +1,9 @@
+{
+  "name": "News-First Quant",
+  "short_name": "News Quant",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0b1210",
+  "theme_color": "#0c1412",
+  "icons": []
+}

@@ -1,0 +1,1 @@
+window.NEWS_QUANT_API_BASE_URL = "";
