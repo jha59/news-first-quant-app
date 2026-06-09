@@ -13,7 +13,21 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = ROOT.parent
-STATIC_ROOT = ROOT / "static"
+
+
+def find_static_root() -> Path:
+    candidates = [
+        ROOT / "static",
+        ROOT,
+        ROOT / "mobile_stock_app" / "static",
+    ]
+    for candidate in candidates:
+        if (candidate / "index.html").exists():
+            return candidate
+    return ROOT / "static"
+
+
+STATIC_ROOT = find_static_root()
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
