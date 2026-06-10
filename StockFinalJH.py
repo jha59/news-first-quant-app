@@ -21,7 +21,8 @@ import time
 import urllib.parse
 import warnings
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 os.environ.setdefault("MPLCONFIGDIR", "/private/tmp/matplotlib")
@@ -374,14 +375,40 @@ def parse_source(title: str) -> Tuple[str, str]:
     return clean_text(title), "Unknown"
 
 
-def google_news_rss(query: str, max_items: int = 12) -> List[NewsItem]:
-    if feedparser is None:
-        return []
-    url = (
-        "https://news.google.com/rss/search?q="
-        + urllib.parse.quote(query)
-        + "&hl=en-US&gl=US&ceid=US:en"
-    )
+def parse_news_datetime(value: str) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = parsedate_to_datetime(str(value))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def news_sort_key(item: NewsItem) -> Tuple[float, float]:
+    published = parse_news_datetime(item.published)
+    timestamp = published.timestamp() if published else 0.0
+    return timestamp, credibility_weight(item.source)
+
+
+def recent_first(items: Iterable[NewsItem], limit: int, max_age_days: int = 3) -> List[NewsItem]:
+    unique = dedupe_news(items)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+    recent = []
+    undated = []
+    for item in unique:
+        published = parse_news_datetime(item.published)
+        if published is None:
+            undated.append(item)
+        elif published >= cutoff:
+            recent.append(item)
+    pool = recent if len(recent) >= max(4, min(limit, 10)) else recent + undated
+    return sorted(pool, key=news_sort_key, reverse=True)[:limit]
+
+
+def parse_google_news_feed(url: str, max_items: int) -> List[NewsItem]:
     raw = request_text(url)
     if not raw:
         return []
@@ -391,7 +418,7 @@ def google_news_rss(query: str, max_items: int = 12) -> List[NewsItem]:
         return []
 
     items = []
-    for entry in feed.entries[:max_items]:
+    for entry in feed.entries[: max_items * 2]:
         title, source = parse_source(getattr(entry, "title", ""))
         if len(title) < 8:
             continue
@@ -404,6 +431,28 @@ def google_news_rss(query: str, max_items: int = 12) -> List[NewsItem]:
             )
         )
     return items
+
+
+def google_news_rss(query: str, max_items: int = 12, recency_days: int = 3) -> List[NewsItem]:
+    if feedparser is None:
+        return []
+    query_variants = [
+        f"{query} when:{max(1, recency_days)}d",
+        f"{query} when:7d",
+        query,
+    ]
+    collected: List[NewsItem] = []
+    for variant in query_variants:
+        url = (
+            "https://news.google.com/rss/search?q="
+            + urllib.parse.quote(variant)
+            + "&hl=en-US&gl=US&ceid=US:en"
+        )
+        collected.extend(parse_google_news_feed(url, max_items=max_items))
+        fresh = recent_first(collected, limit=max_items, max_age_days=max(7, recency_days))
+        if fresh:
+            return fresh
+    return recent_first(collected, limit=max_items, max_age_days=30)
 
 
 def yahoo_ticker_news(ticker: str, max_items: int = 12) -> List[NewsItem]:
@@ -420,8 +469,14 @@ def yahoo_ticker_news(ticker: str, max_items: int = 12) -> List[NewsItem]:
         if not isinstance(title, str) or len(title) < 8:
             continue
         source = row.get("publisher") or "Yahoo Finance"
-        items.append(NewsItem(clean_text(title), str(source), row.get("link") or "", ""))
-    return items
+        published = ""
+        timestamp = row.get("providerPublishTime") or row.get("pubDate")
+        if isinstance(timestamp, (int, float)):
+            published = datetime.fromtimestamp(timestamp, timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
+        elif isinstance(timestamp, str):
+            published = timestamp
+        items.append(NewsItem(clean_text(title), str(source), row.get("link") or "", published))
+    return recent_first(items, limit=max_items, max_age_days=7)
 
 
 def dedupe_news(items: Iterable[NewsItem]) -> List[NewsItem]:
@@ -434,7 +489,7 @@ def dedupe_news(items: Iterable[NewsItem]) -> List[NewsItem]:
             continue
         seen.add(key)
         unique.append(NewsItem(title, item.source, item.url, item.published))
-    return unique
+    return sorted(unique, key=news_sort_key, reverse=True)
 
 
 def credibility_weight(source: str) -> float:
@@ -487,7 +542,7 @@ def keyword_sentiment_score(text: str) -> float:
 def collect_macro_news() -> List[NewsItem]:
     items: List[NewsItem] = []
     for query in live_macro_queries():
-        items.extend(google_news_rss(query, max_items=12))
+        items.extend(google_news_rss(query, max_items=12, recency_days=2))
         time.sleep(0.12)
     return dedupe_news(items)[:60]
 
@@ -502,10 +557,10 @@ def collect_ticker_news(ticker: str, company: str) -> List[NewsItem]:
     ]
     items: List[NewsItem] = []
     for query in queries:
-        items.extend(google_news_rss(query, max_items=9))
+        items.extend(google_news_rss(query, max_items=9, recency_days=2))
         time.sleep(0.12)
     items.extend(yahoo_ticker_news(ticker, max_items=12))
-    return dedupe_news(items)[:50]
+    return recent_first(items, limit=50, max_age_days=7)
 
 
 def macro_regime_score(macro_items: Sequence[NewsItem]) -> Tuple[float, float, Dict[str, int], Dict[str, int]]:
@@ -1001,7 +1056,7 @@ def discover_tickers_from_news(max_tickers: int = 80) -> List[str]:
     ]
     found: List[str] = []
     for query in queries:
-        for item in google_news_rss(query, max_items=25):
+        for item in google_news_rss(query, max_items=25, recency_days=2):
             for pattern in patterns:
                 for match in re.findall(pattern, item.title):
                     ticker = match.upper()
