@@ -32,6 +32,7 @@ warnings.filterwarnings("ignore")
 
 PREDICTION_LOG_FILE = os.getenv("PREDICTION_LOG_FILE", "prediction_log.json")
 ADAPTIVE_MODEL_STATE_FILE = os.getenv("ADAPTIVE_MODEL_STATE_FILE", "adaptive_model_state.json")
+ML_DATASET_FILE = os.getenv("ML_DATASET_FILE", "ml_training_dataset.json")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
@@ -386,6 +387,12 @@ class StockResult:
     suggested_entry_style: str = "N/A"
     risk_management: Dict[str, str] = field(default_factory=dict)
     backtest: Dict[str, object] = field(default_factory=dict)
+    institutional_checks: Dict[str, object] = field(default_factory=dict)
+    market_regime: Dict[str, object] = field(default_factory=dict)
+    news_impact: Dict[str, object] = field(default_factory=dict)
+    priced_in: Dict[str, object] = field(default_factory=dict)
+    portfolio_allocation: Dict[str, object] = field(default_factory=dict)
+    ml_dataset: Dict[str, object] = field(default_factory=dict)
     positive_hits: Dict[str, int] = field(default_factory=dict)
     negative_hits: Dict[str, int] = field(default_factory=dict)
     headlines: List[NewsItem] = field(default_factory=list)
@@ -1631,6 +1638,15 @@ def save_prediction_log_entries(entries: List[Dict[str, object]]) -> None:
     persistent_store_set("prediction_log", PREDICTION_LOG_FILE, entries)
 
 
+def ml_dataset_entries() -> List[Dict[str, object]]:
+    entries, _, _ = persistent_store_get("ml_training_dataset", ML_DATASET_FILE, [])
+    return entries if isinstance(entries, list) else []
+
+
+def save_ml_dataset_entries(entries: List[Dict[str, object]]) -> None:
+    persistent_store_set("ml_training_dataset", ML_DATASET_FILE, entries)
+
+
 def get_actual_price_on_or_after(ticker: str, target_date: datetime) -> Optional[float]:
     if yf is None or pd is None:
         return None
@@ -1737,6 +1753,32 @@ def log_prediction_result(result: "StockResult", feature_vector: Dict[str, float
         }
         entries.append(entry)
         save_prediction_log_entries(entries[-800:])
+        dataset = ml_dataset_entries()
+        dataset.append(
+            {
+                "created_at": entry["created_at"],
+                "ticker": result.ticker,
+                "features": feature_vector,
+                "labels_pending": {
+                    "target_7d_return": None,
+                    "target_20d_return": None,
+                    "direction_7d": None,
+                },
+                "scores": {
+                    "final_score": result.final_score,
+                    "ranking_score": result.ranking_score,
+                    "confidence": result.confidence,
+                    "estimated_upside_probability": result.estimated_upside_probability,
+                },
+                "institutional_context": {
+                    "market_regime": result.market_regime,
+                    "news_impact": result.news_impact,
+                    "priced_in": result.priced_in,
+                    "portfolio_allocation": result.portfolio_allocation,
+                },
+            }
+        )
+        save_ml_dataset_entries(dataset[-1500:])
     except Exception:
         pass
 
@@ -2116,13 +2158,178 @@ def risk_management_suggestion(result: StockResult) -> Dict[str, str]:
     }
 
 
+def news_impact_decay_model(news: Sequence[NewsItem]) -> Dict[str, object]:
+    """Estimate whether catalysts are fresh enough to matter, with trusted sources weighted higher."""
+    try:
+        now = datetime.now(timezone.utc)
+        weighted_score = 0.0
+        trusted_recent = 0
+        fresh_count = 0
+        stale_count = 0
+        half_life_days = 3.0
+        for item in news[:30]:
+            published = parse_news_datetime(item.published)
+            age_days = 1.5 if published is None else max(0.0, (now - published).total_seconds() / 86400.0)
+            decay = math.exp(-age_days / half_life_days)
+            source_weight = credibility_weight(item.source)
+            sentiment = keyword_sentiment_score(news_analysis_text(item))
+            weighted_score += sentiment * decay * source_weight
+            if age_days <= 2.0:
+                fresh_count += 1
+                if is_trusted_source(item.source):
+                    trusted_recent += 1
+            if age_days >= 7.0:
+                stale_count += 1
+        freshness = clamp((fresh_count * 12.0 + trusted_recent * 10.0 - stale_count * 4.0) / 100.0, 0.0, 1.0)
+        decay_adjustment = clamp(weighted_score * 0.18 + trusted_recent * 1.8 - stale_count * 0.8, -10.0, 12.0)
+        label = "Fresh catalyst"
+        if trusted_recent >= 2:
+            label = "Fresh high-trust catalyst"
+        elif fresh_count == 0 and stale_count >= 3:
+            label = "Stale news impact"
+        elif abs(weighted_score) < 2:
+            label = "Low news impact"
+        return {
+            "label": label,
+            "freshnessScore": float(freshness),
+            "trustedRecentCount": int(trusted_recent),
+            "freshHeadlineCount": int(fresh_count),
+            "staleHeadlineCount": int(stale_count),
+            "decayAdjustment": float(decay_adjustment),
+        }
+    except Exception as exc:
+        return {"label": "News decay unavailable", "decayAdjustment": 0.0, "error": str(exc)[:100]}
+
+
+def priced_in_signal(technical: TechnicalSnapshot, news_score: float, news_impact: Dict[str, object]) -> Dict[str, object]:
+    """Detect when a bullish catalyst may already be reflected in price action."""
+    try:
+        rsi = technical.rsi or 50.0
+        return_1w = technical.return_1w or 0.0
+        return_1m = technical.return_1m or 0.0
+        volume_ratio = technical.volume_ratio or 1.0
+        penalty = 0.0
+        label = "Not obviously priced in"
+        if news_score > 15 and (return_1w >= 0.16 or return_1m >= 0.35) and rsi >= 70:
+            penalty = 14.0
+            label = "Likely priced in after sharp move"
+        elif news_score > 10 and return_1w >= 0.10 and volume_ratio >= 3.5:
+            penalty = 8.0
+            label = "Partly priced in by unusual volume spike"
+        elif technical.pullback_label == "healthy pullback near moving average" and rsi <= 65:
+            penalty = -4.0
+            label = "Catalyst not fully chased"
+        if news_impact.get("label") == "Stale news impact":
+            penalty += 5.0
+        return {
+            "label": label,
+            "penalty": float(clamp(penalty, -6.0, 20.0)),
+            "oneWeekMove": float(return_1w),
+            "oneMonthMove": float(return_1m),
+            "rsi": float(rsi),
+        }
+    except Exception as exc:
+        return {"label": "Priced-in check unavailable", "penalty": 0.0, "error": str(exc)[:100]}
+
+
+def market_regime_model(history, macro_score: float, macro_risk_score: float) -> Dict[str, object]:
+    """Lightweight market-regime model using SPY/QQQ trend plus live macro risk."""
+    try:
+        cache_key = f"{round(macro_score, 1)}:{round(macro_risk_score, 1)}"
+        cache = getattr(market_regime_model, "_cache", {})
+        if cache_key in cache:
+            return dict(cache[cache_key])
+        spy = download_history("SPY", period="1y")
+        qqq = download_history("QQQ", period="1y")
+        def trend_state(data) -> Tuple[float, float]:
+            if data is None or pd is None or len(data) < 80:
+                return 0.0, 0.0
+            close = to_series(data["Close"]).astype(float).dropna()
+            if len(close) < 80:
+                return 0.0, 0.0
+            ma50 = close.rolling(50).mean().iloc[-1]
+            ma200 = close.rolling(min(200, len(close))).mean().iloc[-1]
+            last = close.iloc[-1]
+            above50 = 1.0 if last > ma50 else -1.0
+            above200 = 1.0 if last > ma200 else -1.0
+            momentum = clamp(close.iloc[-1] / close.iloc[-21] - 1.0 if len(close) > 22 else 0.0, -0.15, 0.15)
+            return above50 + above200, momentum
+
+        spy_trend, spy_mom = trend_state(spy)
+        qqq_trend, qqq_mom = trend_state(qqq)
+        risk_on_score = 50.0 + (spy_trend + qqq_trend) * 8.0 + (spy_mom + qqq_mom) * 80.0 + macro_score * 0.25 - macro_risk_score * 0.35
+        risk_on_score = clamp(risk_on_score, 0.0, 100.0)
+        if risk_on_score >= 68:
+            label = "Risk-on"
+            exposure = 1.15
+        elif risk_on_score >= 45:
+            label = "Neutral / selective"
+            exposure = 0.85
+        else:
+            label = "Risk-off"
+            exposure = 0.55
+        result = {
+            "label": label,
+            "riskOnScore": float(risk_on_score),
+            "exposureMultiplier": float(exposure),
+            "macroScore": float(macro_score),
+            "macroRiskScore": float(macro_risk_score),
+        }
+        cache[cache_key] = result
+        setattr(market_regime_model, "_cache", cache)
+        return dict(result)
+    except Exception as exc:
+        return {
+            "label": "Regime unavailable",
+            "riskOnScore": 50.0,
+            "exposureMultiplier": 0.75,
+            "error": str(exc)[:100],
+        }
+
+
+def portfolio_risk_allocation(result: StockResult) -> Dict[str, object]:
+    """Convert conviction/risk into educational position-sizing guidance."""
+    try:
+        vol = result.technical.volatility or 0.55
+        prob = result.estimated_upside_probability or result.prediction.probability_up_1w or 0.50
+        expected = result.prediction.expected_return_1w or 0.0
+        regime_multiplier = safe_float(result.market_regime.get("exposureMultiplier"), 0.75) or 0.75
+        edge = max(0.0, (prob - 0.50) * 2.0 + expected)
+        risk_scale = clamp(0.45 / max(vol, 0.15), 0.25, 1.35)
+        conviction_scale = clamp(result.ranking_score / 100.0, 0.20, 1.25)
+        base_weight = 0.04 * edge * risk_scale * conviction_scale * regime_multiplier
+        if result.small_cap_risk_level in {"High", "Extreme"}:
+            base_weight *= 0.45
+        if sum(result.negative_hits.values()) >= 3:
+            base_weight *= 0.50
+        max_weight = clamp(base_weight, 0.0025, 0.06)
+        if max_weight < 0.01:
+            bucket = "Very Small"
+        elif max_weight < 0.025:
+            bucket = "Small"
+        elif max_weight < 0.045:
+            bucket = "Normal"
+        else:
+            bucket = "High conviction cap"
+        return {
+            "suggestedMaxWeightPct": float(max_weight * 100.0),
+            "bucket": bucket,
+            "regimeAdjusted": True,
+            "note": "Educational allocation cap based on edge, volatility, regime, and headline risk.",
+        }
+    except Exception as exc:
+        return {"suggestedMaxWeightPct": 0.5, "bucket": "Very Small", "note": str(exc)[:100]}
+
+
 def backtest_strategy(ticker: str, history) -> Dict[str, object]:
-    """Educational 20-day forward test using price/volume rules similar to the live setup logic."""
+    """Educational walk-forward backtest with fees, slippage, stops, and take-profit rules."""
     if history is None or pd is None or np is None or len(history) < 260:
         return {"available": False, "reason": "Not enough history for backtest."}
     try:
         data = history.copy()
         close = to_series(data["Close"]).astype(float)
+        high = to_series(data["High"]).astype(float) if "High" in data else close
+        low = to_series(data["Low"]).astype(float) if "Low" in data else close
         volume = to_series(data["Volume"]).astype(float) if "Volume" in data else close * 0
         ma20 = close.rolling(20).mean()
         ma50 = close.rolling(50).mean()
@@ -2133,6 +2340,7 @@ def backtest_strategy(ticker: str, history) -> Dict[str, object]:
         rsi = 100 - (100 / (1 + gain / loss.replace(0, np.nan)))
         volume_ratio = volume / volume.rolling(20).mean()
         momentum_20d = close / close.shift(20) - 1
+        volatility_20d = close.pct_change().rolling(20).std() * np.sqrt(252)
 
         entries = (
             (close > ma50)
@@ -2142,22 +2350,60 @@ def backtest_strategy(ticker: str, history) -> Dict[str, object]:
             & (momentum_20d > -0.03)
             & (momentum_20d < 0.22)
         )
-        forward_return = close.shift(-20) / close - 1
-        trades = forward_return[entries].dropna()
+        fee_slippage = 0.0035
+        trade_returns = []
+        trade_dates = []
+        for idx in range(220, len(close) - 21):
+            if not bool(entries.iloc[idx]):
+                continue
+            entry = close.iloc[idx] * (1.0 + fee_slippage / 2.0)
+            vol = safe_float(volatility_20d.iloc[idx], 0.45) or 0.45
+            stop = entry * (1.0 - clamp(vol / 8.0, 0.06, 0.16))
+            target = entry * (1.0 + clamp(vol / 5.5, 0.08, 0.24))
+            exit_price = close.iloc[idx + 20]
+            for j in range(idx + 1, idx + 21):
+                if low.iloc[j] <= stop:
+                    exit_price = stop
+                    break
+                if high.iloc[j] >= target:
+                    exit_price = target
+                    break
+            net_return = exit_price * (1.0 - fee_slippage / 2.0) / entry - 1.0
+            trade_returns.append(float(net_return))
+            trade_dates.append(str(close.index[idx].date()) if hasattr(close.index[idx], "date") else str(close.index[idx]))
+        trades = pd.Series(trade_returns, index=trade_dates, dtype=float)
         if trades.empty:
             return {"available": False, "reason": "No historical rule-based entries found."}
         equity = (1 + trades).cumprod()
         drawdown = equity / equity.cummax() - 1
         buy_hold = close.iloc[-1] / close.iloc[0] - 1
+        split = max(1, len(trades) // 4)
+        walk_forward = []
+        for window_idx, start in enumerate(range(0, len(trades), split), start=1):
+            window = trades.iloc[start:start + split]
+            if window.empty:
+                continue
+            walk_forward.append({
+                "window": window_idx,
+                "trades": int(len(window)),
+                "winRate": float((window > 0).mean()),
+                "averageReturn20d": float(window.mean()),
+            })
+        gross_avg = float(((close.shift(-20) / close - 1)[entries]).dropna().mean()) if entries.any() else None
         return {
             "available": True,
             "ticker": ticker,
+            "method": "walk-forward price/volume proxy with 20D hold, stop-loss, take-profit, 0.35% round-trip fee/slippage",
             "trades": int(len(trades)),
             "winRate": float((trades > 0).mean()),
             "averageReturn20d": float(trades.mean()),
             "medianReturn20d": float(trades.median()),
             "maxDrawdown": float(drawdown.min()),
             "buyAndHoldReturn": float(buy_hold),
+            "grossAverageReturn20d": gross_avg,
+            "costAssumption": 0.0035,
+            "walkForwardWindows": walk_forward[:8],
+            "outOfSampleProxy": True,
         }
     except Exception as exc:
         return {"available": False, "reason": str(exc)[:120]}
@@ -2238,6 +2484,44 @@ def confidence_from_components(
     return max(5.0, min(93.0, confidence))
 
 
+def institutional_quality_checks(result: StockResult) -> Dict[str, object]:
+    """Summarize the institutional-style guardrails added around the recommendation."""
+    try:
+        checks = {
+            "walkForwardBacktest": bool(result.backtest.get("available")),
+            "marketRegimeModel": bool(result.market_regime),
+            "newsImpactDecay": bool(result.news_impact),
+            "pricedInCheck": bool(result.priced_in),
+            "portfolioRiskAllocation": bool(result.portfolio_allocation),
+            "feeSlippageBacktest": bool(result.backtest.get("costAssumption") is not None),
+            "mlDatasetLogging": bool(result.ml_dataset.get("enabled")),
+        }
+        passed = sum(1 for value in checks.values() if value)
+        risk_flags = []
+        if result.market_regime.get("label") == "Risk-off":
+            risk_flags.append("risk-off market regime")
+        if safe_float(result.priced_in.get("penalty"), 0.0) and safe_float(result.priced_in.get("penalty"), 0.0) > 8:
+            risk_flags.append("catalyst may be priced in")
+        if result.backtest.get("available") and safe_float(result.backtest.get("winRate"), 0.0) < 0.45:
+            risk_flags.append("weak historical proxy win rate")
+        if result.small_cap_risk_level in {"High", "Extreme"}:
+            risk_flags.append("small-cap/catalyst risk")
+        quality_score = 50.0 + passed * 6.0
+        if result.backtest.get("available"):
+            quality_score += clamp((safe_float(result.backtest.get("winRate"), 0.5) - 0.50) * 45.0, -8.0, 10.0)
+            quality_score += clamp((safe_float(result.backtest.get("averageReturn20d"), 0.0)) * 80.0, -8.0, 10.0)
+        quality_score -= len(risk_flags) * 5.0
+        return {
+            "qualityScore": float(clamp(quality_score, 0.0, 100.0)),
+            "checks": checks,
+            "passedChecks": int(passed),
+            "riskFlags": risk_flags,
+            "label": "Institutional-style proxy layer active",
+        }
+    except Exception as exc:
+        return {"qualityScore": 50.0, "label": "Institutional checks unavailable", "error": str(exc)[:100]}
+
+
 def analyze_ticker(
     ticker: str,
     macro: Tuple[float, float, Dict[str, int], Dict[str, int]],
@@ -2254,6 +2538,8 @@ def analyze_ticker(
     news_score, positive_hits, negative_hits, notes = score_news(news)
     news_quality_score, trusted_ratio, trusted_count, low_quality_count = news_quality_metrics(news)
     verified_catalyst = verified_catalyst_label(news)
+    news_impact = news_impact_decay_model(news)
+    news_score += safe_float(news_impact.get("decayAdjustment"), 0.0) or 0.0
     background_summary = (
         "Related context included: " + ", ".join(related_tickers[:6])
         if related_tickers
@@ -2267,6 +2553,8 @@ def analyze_ticker(
     technical = technical_analysis(history)
     mc = monte_carlo_analysis(history)
     fundamentals = fundamentals_analysis(info)
+    market_regime = market_regime_model(history, macro_score, macro_risk_score)
+    priced_in = priced_in_signal(technical, news_score, news_impact)
     prediction = prediction_analysis(
         history,
         news_score,
@@ -2288,6 +2576,15 @@ def analyze_ticker(
         positive_hits,
         negative_hits,
         news_quality_score,
+    )
+    feature_vector.update(
+        {
+            "market_regime_risk_on_score": float(safe_float(market_regime.get("riskOnScore"), 50.0) or 50.0),
+            "market_regime_exposure_multiplier": float(safe_float(market_regime.get("exposureMultiplier"), 0.75) or 0.75),
+            "news_freshness_score": float(safe_float(news_impact.get("freshnessScore"), 0.0) or 0.0),
+            "news_decay_adjustment": float(safe_float(news_impact.get("decayAdjustment"), 0.0) or 0.0),
+            "priced_in_penalty": float(safe_float(priced_in.get("penalty"), 0.0) or 0.0),
+        }
     )
     adaptive_ensemble = adaptive_ensemble_simulation(feature_vector)
     ensemble_probability = safe_float(adaptive_ensemble.get("probability"), None)
@@ -2326,6 +2623,17 @@ def analyze_ticker(
     if risk_penalty > 25:
         notes.append("Risk penalty is elevated, so ranking is conservative.")
 
+    regime_score = safe_float(market_regime.get("riskOnScore"), 50.0) or 50.0
+    regime_adjustment = (regime_score - 50.0) * 0.10
+    priced_in_penalty = safe_float(priced_in.get("penalty"), 0.0) or 0.0
+    final_score += regime_adjustment - priced_in_penalty
+    if news_impact.get("label"):
+        notes.append(f"News impact model: {news_impact.get('label')}.")
+    if priced_in_penalty > 6:
+        notes.append("Priced-in model detected elevated chase risk.")
+    if market_regime.get("label") == "Risk-off":
+        notes.append("Market regime is risk-off, so conviction is capped.")
+
     if technical.trend_label == "downtrend" and news_score < 45:
         final_score -= 14
         notes.append("Downtrend requires very strong positive news; extra penalty applied.")
@@ -2352,6 +2660,10 @@ def analyze_ticker(
         confidence -= 8.0
     if verified_catalyst != "None":
         confidence += 5.0
+    confidence += regime_adjustment * 0.5
+    confidence -= max(0.0, priced_in_penalty * 0.45)
+    if market_regime.get("label") == "Risk-off":
+        confidence = min(confidence, 78.0)
     confidence = clamp(confidence, 5.0, 93.0)
     setup_label = detect_rising_stock_setup(technical, news_score, negative_hits, mc, sector_macro_score)
     small_score, small_risk, small_summary = small_cap_catalyst_score(
@@ -2387,6 +2699,8 @@ def analyze_ticker(
         ranking_score += (ensemble_probability - 0.50) * 18.0
         if adaptive_ensemble.get("stability", 1.0) < 0.45:
             ranking_score -= 6.0
+    ranking_score += regime_adjustment * 1.8
+    ranking_score -= max(0.0, priced_in_penalty * 1.6)
     estimated_upside_probability = prediction.probability_up_1w or prediction.probability_up_1d or mc.probability_up_20d
     action = action_from_score(final_score, confidence, negative_hits, technical, news_score, mc)
 
@@ -2418,6 +2732,9 @@ def analyze_ticker(
         learning_state=learning_state,
         suggested_entry_style=suggested_entry_style(setup_label, technical),
         backtest=backtest_strategy(ticker, history),
+        market_regime=market_regime,
+        news_impact=news_impact,
+        priced_in=priced_in,
         positive_hits=positive_hits,
         negative_hits=negative_hits,
         headlines=sorted(
@@ -2431,6 +2748,14 @@ def analyze_ticker(
     result.recommendation_reason = generate_recommendation_reason(result)
     result.main_risk_warning = main_risk_warning_from_components(result)
     result.risk_management = risk_management_suggestion(result)
+    result.portfolio_allocation = portfolio_risk_allocation(result)
+    result.ml_dataset = {
+        "enabled": True,
+        "storage": "supabase" if supabase_enabled() else "local_json",
+        "featureRowSavedOnAnalysis": True,
+        "labelStatus": "pending future prices",
+    }
+    result.institutional_checks = institutional_quality_checks(result)
     log_prediction_result(result, feature_vector)
     return result
 

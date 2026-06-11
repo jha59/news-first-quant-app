@@ -41,6 +41,11 @@ const translations = {
     relatedContext: "Related Context",
     adaptivePolicy: "Adaptive Ensemble",
     learningLoop: "Learning Loop",
+    institutionalLayer: "Institutional Proxy Layer",
+    marketRegime: "Market Regime",
+    newsImpact: "News Impact",
+    portfolioAllocation: "Portfolio Allocation",
+    walkForward: "Walk-forward Backtest",
     whyThis: "Why This Stock?",
     riskWarning: "Main Risk Warning",
     riskManagement: "Risk Management",
@@ -90,6 +95,11 @@ const translations = {
     relatedContext: "관련 배경",
     adaptivePolicy: "적응형 앙상블",
     learningLoop: "학습 루프",
+    institutionalLayer: "기관급 프록시 레이어",
+    marketRegime: "시장 레짐",
+    newsImpact: "뉴스 영향",
+    portfolioAllocation: "포트폴리오 배분",
+    walkForward: "워크포워드 백테스트",
     whyThis: "왜 이 종목인가?",
     riskWarning: "주요 리스크",
     riskManagement: "리스크 관리",
@@ -479,6 +489,23 @@ function renderResult(rawRow) {
       <div class="metric narrative">
         <span>${t("learningLoop")}</span>
         <p>Evaluated now: ${escapeHtml(row.learningState?.evaluatedNow ?? 0)} · Avg error: ${row.learningState?.lastAverageError == null ? "Waiting for 7-day results" : pct(row.learningState.lastAverageError)}</p>
+      </div>
+
+      <div class="metric narrative">
+        <span>${t("institutionalLayer")}</span>
+        <p>Quality ${num(row.institutionalChecks?.qualityScore)} · Passed ${escapeHtml(row.institutionalChecks?.passedChecks ?? 0)} checks · ${escapeHtml((row.institutionalChecks?.riskFlags || []).join(", ") || "No major proxy flags")}</p>
+      </div>
+
+      <div class="score-grid">
+        <div class="metric"><span>${t("marketRegime")}</span><strong>${escapeHtml(row.marketRegime?.label || "Not enough data")}</strong><span>Risk-on ${num(row.marketRegime?.riskOnScore)}</span></div>
+        <div class="metric"><span>${t("newsImpact")}</span><strong>${escapeHtml(row.newsImpact?.label || "Not enough data")}</strong><span>Fresh ${num(row.newsImpact?.freshnessScore)} · trusted ${escapeHtml(row.newsImpact?.trustedRecentCount ?? 0)}</span></div>
+        <div class="metric"><span>Priced-in</span><strong>${escapeHtml(row.pricedIn?.label || "Not enough data")}</strong><span>Penalty ${num(row.pricedIn?.penalty)}</span></div>
+        <div class="metric"><span>${t("portfolioAllocation")}</span><strong>${escapeHtml(row.portfolioAllocation?.bucket || "Very Small")}</strong><span>Max ${num(row.portfolioAllocation?.suggestedMaxWeightPct)}%</span></div>
+      </div>
+
+      <div class="metric narrative">
+        <span>${t("walkForward")}</span>
+        <p>${row.backtest?.available ? `Trades ${escapeHtml(row.backtest.trades)} · Win ${pct(row.backtest.winRate)} · Avg 20D ${pct(row.backtest.averageReturn20d, true)} · Max DD ${pct(row.backtest.maxDrawdown)}` : escapeHtml(row.backtest?.reason || "Not enough data")}</p>
       </div>
 
       <div class="metric narrative">
