@@ -346,6 +346,108 @@ function fallbackRiskManagement(row) {
   };
 }
 
+function fallbackMarketRegime() {
+  const macro = latestData?.macro || {};
+  const macroScore = safeNumber(macro.score);
+  const riskScore = safeNumber(macro.riskScore);
+  const riskOnScore = Math.max(0, Math.min(100, 50 + macroScore * 0.35 - riskScore * 0.25));
+  const label = riskOnScore >= 68 ? "Risk-on" : riskOnScore >= 45 ? "Neutral / selective" : "Risk-off";
+  const exposureMultiplier = riskOnScore >= 68 ? 1.15 : riskOnScore >= 45 ? 0.85 : 0.55;
+  return {
+    label,
+    riskOnScore,
+    exposureMultiplier,
+    macroScore,
+    macroRiskScore: riskScore,
+    fallback: true,
+  };
+}
+
+function fallbackNewsImpact(row) {
+  const sources = (row.headlines || []).map((item) => String(item.source || "").toLowerCase());
+  const trustedRecentCount = sources.filter((source) =>
+    ["reuters", "bloomberg", "associated press", "ap", "wall street journal", "cnbc", "marketwatch", "yahoo finance", "sec"].some((name) => source.includes(name))
+  ).length;
+  const freshnessScore = Math.max(0, Math.min(1, (row.headlines || []).length / 8 + trustedRecentCount * 0.08));
+  const label = trustedRecentCount >= 2 ? "Fresh high-trust catalyst" : row.headlines?.length ? "Fresh catalyst proxy" : "No current catalyst data";
+  return {
+    label,
+    freshnessScore,
+    trustedRecentCount,
+    freshHeadlineCount: row.headlines?.length || 0,
+    staleHeadlineCount: 0,
+    decayAdjustment: 0,
+    fallback: true,
+  };
+}
+
+function fallbackPricedIn(row) {
+  const rsi = safeNumber(row.technical?.rsi, 50);
+  const oneWeekMove = safeNumber(row.technical?.return1w);
+  const oneMonthMove = safeNumber(row.technical?.return1m);
+  const volumeRatio = safeNumber(row.technical?.volumeRatio, 1);
+  let label = "Not obviously priced in";
+  let penalty = 0;
+  if (safeNumber(row.newsScore) > 15 && (oneWeekMove >= 0.16 || oneMonthMove >= 0.35) && rsi >= 70) {
+    label = "Likely priced in after sharp move";
+    penalty = 14;
+  } else if (safeNumber(row.newsScore) > 10 && oneWeekMove >= 0.1 && volumeRatio >= 3.5) {
+    label = "Partly priced in by volume spike";
+    penalty = 8;
+  } else if (row.technical?.pullbackLabel === "healthy pullback near moving average" && rsi <= 65) {
+    label = "Catalyst not fully chased";
+    penalty = -4;
+  }
+  return { label, penalty, oneWeekMove, oneMonthMove, rsi, fallback: true };
+}
+
+function fallbackPortfolioAllocation(row, regime, smallCapRisk) {
+  const volatility = Math.max(0.15, safeNumber(row.technical?.volatility, 0.55));
+  const prob = safeNumber(row.estimatedUpsideProbability, row.prediction?.probabilityUp1w, row.monteCarlo?.probabilityUp20d, 0.5);
+  const expected = safeNumber(row.prediction?.expectedReturn1w);
+  const edge = Math.max(0, (prob - 0.5) * 2 + expected);
+  const riskScale = Math.max(0.25, Math.min(1.35, 0.45 / volatility));
+  const convictionScale = Math.max(0.2, Math.min(1.25, safeNumber(row.rankingScore, row.finalScore) / 100));
+  let maxWeight = 0.04 * edge * riskScale * convictionScale * safeNumber(regime.exposureMultiplier, 0.75);
+  if (smallCapRisk === "High" || smallCapRisk === "Extreme") maxWeight *= 0.45;
+  maxWeight = Math.max(0.0025, Math.min(0.06, maxWeight));
+  const pctValue = maxWeight * 100;
+  const bucket = pctValue < 1 ? "Very Small" : pctValue < 2.5 ? "Small" : pctValue < 4.5 ? "Normal" : "High conviction cap";
+  return {
+    suggestedMaxWeightPct: pctValue,
+    bucket,
+    regimeAdjusted: true,
+    note: "Frontend fallback allocation until backend institutional fields are deployed.",
+    fallback: true,
+  };
+}
+
+function fallbackInstitutionalChecks(row, marketRegime, pricedIn, portfolioAllocation) {
+  const checks = {
+    marketRegimeModel: true,
+    newsImpactDecay: true,
+    pricedInCheck: true,
+    portfolioRiskAllocation: true,
+    walkForwardBacktest: !!row.backtest?.available,
+    feeSlippageBacktest: !!row.backtest?.costAssumption,
+    mlDatasetLogging: !!row.mlDataset?.enabled,
+  };
+  const passedChecks = Object.values(checks).filter(Boolean).length;
+  const riskFlags = [];
+  if (marketRegime.label === "Risk-off") riskFlags.push("risk-off market regime");
+  if (safeNumber(pricedIn.penalty) > 8) riskFlags.push("catalyst may be priced in");
+  if (row.backtest?.available && safeNumber(row.backtest.winRate) < 0.45) riskFlags.push("weak historical proxy win rate");
+  const qualityScore = Math.max(0, Math.min(100, 50 + passedChecks * 6 - riskFlags.length * 5));
+  return {
+    qualityScore,
+    checks,
+    passedChecks,
+    riskFlags,
+    label: "Frontend institutional proxy fallback",
+    fallback: true,
+  };
+}
+
 function hydrateResult(row) {
   const setup = hasRealText(row.risingSetupLabel) ? row.risingSetupLabel : fallbackSetup(row);
   const estimatedUpsideProbability = safeNumber(
@@ -366,6 +468,15 @@ function hydrateResult(row) {
         positionSize: hasRealText(row.riskManagement.positionSize) ? row.riskManagement.positionSize : fallbackRisk.positionSize,
       }
     : fallbackRisk;
+  const marketRegime = row.marketRegime && hasRealText(row.marketRegime.label) ? row.marketRegime : fallbackMarketRegime();
+  const newsImpact = row.newsImpact && hasRealText(row.newsImpact.label) ? row.newsImpact : fallbackNewsImpact(row);
+  const pricedIn = row.pricedIn && hasRealText(row.pricedIn.label) ? row.pricedIn : fallbackPricedIn(row);
+  const portfolioAllocation = row.portfolioAllocation && hasRealText(row.portfolioAllocation.bucket)
+    ? row.portfolioAllocation
+    : fallbackPortfolioAllocation({ ...row, estimatedUpsideProbability }, marketRegime, smallCapRisk);
+  const institutionalChecks = row.institutionalChecks && isFiniteNumber(row.institutionalChecks.qualityScore)
+    ? row.institutionalChecks
+    : fallbackInstitutionalChecks(row, marketRegime, pricedIn, portfolioAllocation);
   return {
     ...row,
     rankingScore: isFiniteNumber(row.rankingScore) ? row.rankingScore : fallbackRankingScore(row, setup),
@@ -379,6 +490,11 @@ function hydrateResult(row) {
     mainRiskWarning: hasRealText(row.mainRiskWarning) ? row.mainRiskWarning : fallbackRiskWarning(row, smallCapRisk),
     suggestedEntryStyle: hasRealText(row.suggestedEntryStyle) ? row.suggestedEntryStyle : fallbackEntryStyle(setup),
     riskManagement,
+    institutionalChecks,
+    marketRegime,
+    newsImpact,
+    pricedIn,
+    portfolioAllocation,
     technical: {
       ...row.technical,
       volumeRatio: isFiniteNumber(row.technical?.volumeRatio) ? row.technical.volumeRatio : 1,

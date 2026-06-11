@@ -1,4 +1,4 @@
-const CACHE = "news-first-quant-v12";
+const CACHE = "news-first-quant-v13";
 const ASSETS = ["/", "/index.html", "/styles.css", "/app.js", "/config.js", "/manifest.json"];
 
 self.addEventListener("install", (event) => {
