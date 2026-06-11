@@ -20,6 +20,8 @@ import re
 import time
 import urllib.parse
 import warnings
+import html
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -27,6 +29,13 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 os.environ.setdefault("MPLCONFIGDIR", "/private/tmp/matplotlib")
 warnings.filterwarnings("ignore")
+
+PREDICTION_LOG_FILE = os.getenv("PREDICTION_LOG_FILE", "prediction_log.json")
+ADAPTIVE_MODEL_STATE_FILE = os.getenv("ADAPTIVE_MODEL_STATE_FILE", "adaptive_model_state.json")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
+SUPABASE_STATE_TABLE = os.getenv("SUPABASE_STATE_TABLE", "quant_state")
 
 try:
     import feedparser
@@ -115,10 +124,54 @@ SECTOR_MAP = {
     "AMGN": "biotech", "MRNA": "biotech", "UNH": "managed_care",
     "JPM": "financials", "V": "payments", "MA": "payments",
     "COST": "consumer_quality", "WMT": "consumer_quality",
+    "DXYZ": "private_tech_space",
+}
+
+
+RELATED_TICKER_MAP = {
+    "DXYZ": ["RKLB", "ASTS", "RDW", "PLTR", "NVDA"],
+    "NVDA": ["AMD", "AVGO", "TSM", "MRVL", "MU", "SMCI", "VRT"],
+    "AMD": ["NVDA", "AVGO", "TSM", "MRVL", "MU", "SMCI"],
+    "AVGO": ["NVDA", "AMD", "MRVL", "TSM", "ANET", "VRT"],
+    "TSM": ["NVDA", "AMD", "AVGO", "ARM", "MU"],
+    "SMCI": ["NVDA", "VRT", "ANET", "DELL", "HPE"],
+    "RKLB": ["LMT", "NOC", "KTOS", "ASTS", "RDW", "PLTR"],
+    "ASTS": ["RKLB", "RDW", "IRDM", "T", "VZ"],
+    "RDW": ["RKLB", "ASTS", "LMT", "NOC", "KTOS"],
+    "IONQ": ["QUBT", "RGTI", "NVDA", "MSFT", "GOOGL"],
+    "QUBT": ["IONQ", "RGTI", "IBM", "GOOGL", "MSFT"],
+    "RGTI": ["IONQ", "QUBT", "IBM", "GOOGL", "MSFT"],
+    "PLTR": ["NVDA", "MSFT", "LMT", "RTX", "KTOS"],
+    "CRSP": ["NTLA", "BEAM", "VRTX", "REGN"],
+    "NTLA": ["CRSP", "BEAM", "VRTX", "REGN"],
+    "BEAM": ["CRSP", "NTLA", "VRTX", "REGN"],
+    "RXRX": ["SDGR", "DNA", "NVDA", "LLY"],
+    "SMR": ["OKLO", "LEU", "CCJ", "CEG", "GEV"],
+    "OKLO": ["SMR", "LEU", "CCJ", "CEG", "GEV"],
+    "CCJ": ["UEC", "UUUU", "NXE", "SMR", "OKLO"],
+    "MARA": ["RIOT", "CLSK", "IREN", "CIFR", "COIN"],
+    "RIOT": ["MARA", "CLSK", "IREN", "CIFR", "COIN"],
+}
+
+
+SECTOR_RELATED_TICKERS = {
+    "ai_semis": ["NVDA", "AMD", "AVGO", "TSM", "MRVL", "MU", "SMCI", "VRT"],
+    "space": ["RKLB", "ASTS", "RDW", "IRDM", "SPIR", "PL"],
+    "space_defense": ["RKLB", "ASTS", "RDW", "KTOS", "AVAV", "LMT", "NOC"],
+    "private_tech_space": ["DXYZ", "RKLB", "ASTS", "RDW", "NVDA", "PLTR"],
+    "defense_ai": ["PLTR", "KTOS", "LMT", "NOC", "RTX", "AVAV"],
+    "biotech": ["CRSP", "NTLA", "BEAM", "RXRX", "SDGR", "TGTX", "VKTX"],
+    "uranium": ["CCJ", "UEC", "UUUU", "NXE", "SMR", "OKLO", "LEU"],
+    "nuclear_power": ["CEG", "GEV", "SMR", "OKLO", "LEU", "CCJ"],
+    "cyber": ["CRWD", "PANW", "NET", "DDOG", "MSFT"],
+    "software": ["CRM", "NOW", "DDOG", "SNOW", "PLTR", "ORCL"],
+    "energy": ["XOM", "CVX", "COP", "SLB"],
 }
 
 
 SOURCE_CREDIBILITY = {
+    "SEC": 1.45,
+    "SEC Filing": 1.45,
     "Reuters": 1.35,
     "Bloomberg": 1.30,
     "Associated Press": 1.25,
@@ -136,6 +189,29 @@ SOURCE_CREDIBILITY = {
     "Motley Fool": 0.75,
 }
 
+TRUSTED_NEWS_SOURCES = {
+    "reuters", "bloomberg", "associated press", "ap", "the wall street journal",
+    "wsj", "cnbc", "barron's", "marketwatch", "yahoo finance",
+    "investor's business daily", "sec", "sec filing", "globenewswire",
+    "pr newswire", "business wire",
+}
+
+LOW_QUALITY_SOURCE_PATTERNS = {
+    "youtube", "youtu.be", "mshale", "fathom journal", "kamikaze", "sommer",
+    "insider monkey", "zacks", "stocktwits", "reddit", "substack", "medium",
+    "247wallst", "24/7 wall st", "tipranks", "gurufocus", "moomoo",
+    "tradingkey", "ainvest", "coinpedia", "cryptopolitan", "aol", "msn",
+    "marketbeat", "simply wall st", "nasdaq.com", "benzinga", "blockonomi",
+    "ad hoc news", "seeking alpha", "motley fool", "the motley fool",
+    "tradingview", "capital.com", "intellectia", "tech times", "newsline",
+    "streetwise reports", "futu", "富途牛牛",
+}
+
+LOW_QUALITY_TITLE_PATTERNS = {
+    "youtube", "watch:", "video:", "today on", "fox on", "cnnbc & fox",
+    "kamikaze", "sommer", "reddit", "rumor", "click here",
+}
+
 
 POSITIVE_EVENTS = {
     "earnings_guidance": [
@@ -150,6 +226,8 @@ POSITIVE_EVENTS = {
     "contract_partnership": [
         "contract", "deal", "partnership", "collaboration", "agreement",
         "selected by", "supplier", "wins award", "government contract",
+        "strategic partnership", "joint venture", "multi-year contract",
+        "commercial agreement", "distribution agreement", "launch partner",
     ],
     "ai_data_center": [
         "artificial intelligence", " ai ", "data center", "gpu", "accelerator",
@@ -166,6 +244,9 @@ POSITIVE_EVENTS = {
     "biotech_healthcare": [
         "fda approval", "drug approved", "phase 2", "phase ii", "phase 3",
         "phase iii", "met primary endpoint", "positive trial", "clinical trial",
+        "successful trial", "trial success", "statistically significant",
+        "breakthrough therapy", "fast track designation", "priority review",
+        "pdufa", "expanded label", "positive topline", "topline results",
     ],
     "capital_return": ["buyback", "share repurchase", "dividend hike", "raises dividend"],
 }
@@ -215,6 +296,7 @@ class NewsItem:
     source: str = "Unknown"
     url: str = ""
     published: str = ""
+    summary: str = ""
 
 
 @dataclass
@@ -293,6 +375,12 @@ class StockResult:
     small_cap_catalyst_score: float = 0.0
     small_cap_risk_level: str = "N/A"
     small_cap_summary: str = "N/A"
+    verified_catalyst: str = "None"
+    news_quality_score: float = 0.0
+    related_tickers: List[str] = field(default_factory=list)
+    background_summary: str = "N/A"
+    adaptive_ensemble: Dict[str, object] = field(default_factory=dict)
+    learning_state: Dict[str, object] = field(default_factory=dict)
     recommendation_reason: str = "N/A"
     main_risk_warning: str = "N/A"
     suggested_entry_style: str = "N/A"
@@ -350,6 +438,7 @@ def setup_finbert() -> None:
 
 
 def clean_text(text: str) -> str:
+    text = html.unescape(str(text))
     text = re.sub(r"<[^>]+>", " ", str(text))
     text = re.sub(r"\s+", " ", text)
     return text.strip()
@@ -392,6 +481,30 @@ def parse_source(title: str) -> Tuple[str, str]:
     if len(parts) == 2 and 2 <= len(parts[1]) <= 55:
         return clean_text(parts[0]), clean_text(parts[1])
     return clean_text(title), "Unknown"
+
+
+def entry_summary(entry) -> str:
+    """Safely extract RSS/Yahoo summary text when the publisher provides it."""
+    for attr in ("summary", "description"):
+        value = getattr(entry, attr, "")
+        if value:
+            return clean_text(value)[:900]
+    try:
+        content = getattr(entry, "content", [])
+        if content and isinstance(content, list):
+            value = content[0].get("value", "")
+            if value:
+                return clean_text(value)[:900]
+    except Exception:
+        return ""
+    return ""
+
+
+def news_analysis_text(item: NewsItem) -> str:
+    summary = clean_text(item.summary)
+    if summary:
+        return f"{item.title}. {summary}"
+    return item.title
 
 
 def parse_news_datetime(value: str) -> Optional[datetime]:
@@ -447,6 +560,7 @@ def parse_google_news_feed(url: str, max_items: int) -> List[NewsItem]:
                 source=source,
                 url=getattr(entry, "link", ""),
                 published=getattr(entry, "published", ""),
+                summary=entry_summary(entry),
             )
         )
     return items
@@ -467,7 +581,7 @@ def google_news_rss(query: str, max_items: int = 12, recency_days: int = 3) -> L
             + urllib.parse.quote(variant)
             + "&hl=en-US&gl=US&ceid=US:en"
         )
-        collected.extend(parse_google_news_feed(url, max_items=max_items))
+        collected.extend(filter_news_quality(parse_google_news_feed(url, max_items=max_items), keep_low_quality_if_empty=False))
         fresh = recent_first(collected, limit=max_items, max_age_days=max(7, recency_days))
         if fresh:
             return fresh
@@ -494,8 +608,62 @@ def yahoo_ticker_news(ticker: str, max_items: int = 12) -> List[NewsItem]:
             published = datetime.fromtimestamp(timestamp, timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
         elif isinstance(timestamp, str):
             published = timestamp
-        items.append(NewsItem(clean_text(title), str(source), row.get("link") or "", published))
-    return recent_first(items, limit=max_items, max_age_days=7)
+        summary = row.get("summary") or row.get("description") or ""
+        items.append(NewsItem(clean_text(title), str(source), row.get("link") or "", published, clean_text(summary)[:900]))
+    return recent_first(filter_news_quality(items, keep_low_quality_if_empty=True), limit=max_items, max_age_days=7)
+
+
+def is_trusted_source(source: str) -> bool:
+    source_lower = source.lower()
+    return any(name in source_lower for name in TRUSTED_NEWS_SOURCES)
+
+
+def is_low_quality_news(item: NewsItem) -> bool:
+    source_lower = item.source.lower()
+    title_lower = item.title.lower()
+    if any(pattern in source_lower for pattern in LOW_QUALITY_SOURCE_PATTERNS):
+        return True
+    if any(pattern in title_lower for pattern in LOW_QUALITY_TITLE_PATTERNS):
+        return True
+    if len(item.title.split()) < 5:
+        return True
+    return False
+
+
+def title_tokens(title: str) -> set:
+    stop = {
+        "the", "and", "for", "with", "from", "that", "this", "are", "stock",
+        "stocks", "shares", "today", "latest", "update", "news", "after",
+    }
+    return {token for token in re.findall(r"[a-z0-9]+", title.lower()) if len(token) > 2 and token not in stop}
+
+
+def similar_title(a: str, b: str) -> bool:
+    tokens_a = title_tokens(a)
+    tokens_b = title_tokens(b)
+    if not tokens_a or not tokens_b:
+        return False
+    overlap = len(tokens_a & tokens_b) / max(1, min(len(tokens_a), len(tokens_b)))
+    return overlap >= 0.72
+
+
+def better_news_item(current: NewsItem, candidate: NewsItem) -> NewsItem:
+    current_key = news_sort_key(current)
+    candidate_key = news_sort_key(candidate)
+    current_quality = credibility_weight(current.source) + (0.20 if is_trusted_source(current.source) else 0.0)
+    candidate_quality = credibility_weight(candidate.source) + (0.20 if is_trusted_source(candidate.source) else 0.0)
+    if candidate_quality > current_quality + 0.08:
+        return candidate
+    if abs(candidate_quality - current_quality) <= 0.08 and candidate_key > current_key:
+        return candidate
+    return current
+
+
+def filter_news_quality(items: Iterable[NewsItem], keep_low_quality_if_empty: bool = False) -> List[NewsItem]:
+    filtered = [item for item in items if not is_low_quality_news(item)]
+    if not filtered and keep_low_quality_if_empty:
+        filtered = list(items)
+    return filtered
 
 
 def dedupe_news(items: Iterable[NewsItem]) -> List[NewsItem]:
@@ -507,7 +675,15 @@ def dedupe_news(items: Iterable[NewsItem]) -> List[NewsItem]:
         if not key or key in seen:
             continue
         seen.add(key)
-        unique.append(NewsItem(title, item.source, item.url, item.published))
+        candidate = NewsItem(title, item.source, item.url, item.published, clean_text(item.summary)[:900])
+        replaced = False
+        for idx, existing in enumerate(unique):
+            if similar_title(existing.title, candidate.title):
+                unique[idx] = better_news_item(existing, candidate)
+                replaced = True
+                break
+        if not replaced:
+            unique.append(candidate)
     return sorted(unique, key=news_sort_key, reverse=True)
 
 
@@ -563,7 +739,7 @@ def collect_macro_news() -> List[NewsItem]:
     for query in live_macro_queries():
         items.extend(google_news_rss(query, max_items=12, recency_days=2))
         time.sleep(0.12)
-    return dedupe_news(items)[:60]
+    return filter_news_quality(dedupe_news(items), keep_low_quality_if_empty=True)[:60]
 
 
 def collect_ticker_news(ticker: str, company: str) -> List[NewsItem]:
@@ -579,11 +755,73 @@ def collect_ticker_news(ticker: str, company: str) -> List[NewsItem]:
         items.extend(google_news_rss(query, max_items=9, recency_days=2))
         time.sleep(0.12)
     items.extend(yahoo_ticker_news(ticker, max_items=12))
-    return recent_first(items, limit=50, max_age_days=7)
+    return recent_first(filter_news_quality(items, keep_low_quality_if_empty=True), limit=50, max_age_days=7)
+
+
+def related_tickers_for(ticker: str, sector: str) -> List[str]:
+    """Return peers/proxy tickers used for background context, not direct recommendations."""
+    ticker = ticker.upper()
+    mapped = RELATED_TICKER_MAP.get(ticker, [])
+    sector_peers = SECTOR_RELATED_TICKERS.get(sector, [])
+    return [item for item in dict.fromkeys(mapped + sector_peers) if item != ticker][:8]
+
+
+def background_queries_for(ticker: str, company: str, sector: str, info: Optional[Dict] = None) -> List[str]:
+    """Build context queries so special situations like DXYZ/SpaceX are not missed."""
+    info = info or {}
+    yf_sector = clean_text(info.get("sector", ""))
+    industry = clean_text(info.get("industry", ""))
+    base = [
+        f"{company} related stocks sector catalyst Reuters CNBC Bloomberg",
+        f"{ticker} peers related stocks catalyst macro tailwind",
+        f"{company} collaboration partnership contract opportunity Reuters CNBC Bloomberg",
+        f"{company} government contract strategic partnership product launch Reuters",
+    ]
+    if yf_sector or industry:
+        base.extend(
+            [
+                f"{yf_sector} {industry} sector latest catalyst stocks Reuters CNBC",
+                f"{industry} competitors partnership clinical contract latest news",
+            ]
+        )
+    if ticker.upper() == "DXYZ" or sector == "private_tech_space":
+        base.extend(
+            [
+                "SpaceX IPO Starlink IPO valuation Reuters CNBC Bloomberg",
+                "SpaceX private market valuation tender offer Destiny Tech100 DXYZ",
+                "private tech IPO market SpaceX Starlink xAI CNBC Reuters",
+            ]
+        )
+    if sector in {"space", "space_defense"}:
+        base.extend(
+            [
+                "space stocks launch contracts defense satellite Reuters CNBC",
+                "NASA contract space defense company latest news",
+            ]
+        )
+    if sector in {"ai_semis", "data_center", "mega_tech"}:
+        base.append("AI data center semiconductor capex latest Reuters CNBC Bloomberg")
+    if sector == "biotech":
+        base.append("FDA approval clinical trial phase 2 phase 3 biotech latest Reuters")
+        base.append(f"{company} trial success endpoint approval partnership biotech")
+    return base[:7]
+
+
+def collect_related_background_news(ticker: str, company: str, sector: str, info: Optional[Dict] = None) -> Tuple[List[NewsItem], List[str]]:
+    """Collect related ticker/background news with strict quality filtering."""
+    items: List[NewsItem] = []
+    for query in background_queries_for(ticker, company, sector, info):
+        items.extend(google_news_rss(query, max_items=5, recency_days=5))
+        time.sleep(0.08)
+    related = related_tickers_for(ticker, sector)
+    for peer in related[:4]:
+        items.extend(google_news_rss(f"{peer} stock latest catalyst Reuters CNBC Bloomberg", max_items=3, recency_days=3))
+        time.sleep(0.06)
+    return recent_first(filter_news_quality(items, keep_low_quality_if_empty=True), limit=20, max_age_days=10), related
 
 
 def macro_regime_score(macro_items: Sequence[NewsItem]) -> Tuple[float, float, Dict[str, int], Dict[str, int]]:
-    text = clean_text(" ".join(item.title for item in macro_items)).lower()
+    text = clean_text(" ".join(news_analysis_text(item) for item in macro_items)).lower()
     positive = {
         "ai_semiconductor_tailwind": [
             "ai", "artificial intelligence", "chip", "semiconductor", "data center",
@@ -658,10 +896,52 @@ def news_recency_weight(item: NewsItem) -> float:
     return 0.40
 
 
+def news_quality_metrics(items: Sequence[NewsItem]) -> Tuple[float, float, int, int]:
+    if not items:
+        return 0.0, 0.0, 0, 0
+    trusted_count = sum(1 for item in items if is_trusted_source(item.source))
+    low_count = sum(1 for item in items if is_low_quality_news(item))
+    avg_credibility = sum(credibility_weight(item.source) for item in items) / max(len(items), 1)
+    trusted_ratio = trusted_count / max(len(items), 1)
+    breadth_score = min(len(items), 8) / 8.0
+    multi_trust_score = min(trusted_count, 4) / 4.0
+    quality_score = clamp(
+        avg_credibility * 42.0
+        + trusted_ratio * 25.0
+        + breadth_score * 15.0
+        + multi_trust_score * 18.0
+        - low_count * 6.0,
+        0.0,
+        100.0,
+    )
+    return quality_score, trusted_ratio, trusted_count, low_count
+
+
+def verified_catalyst_label(items: Sequence[NewsItem]) -> str:
+    """Require at least two high-trust sources to confirm the same catalyst family."""
+    if not items:
+        return "None"
+    event_sources: Dict[str, set] = {}
+    for item in items:
+        if not is_trusted_source(item.source):
+            continue
+        text = news_analysis_text(item).lower()
+        for event, keywords in POSITIVE_EVENTS.items():
+            if any(keyword.strip().lower() in f" {text} " for keyword in keywords):
+                event_sources.setdefault(event, set()).add(item.source.lower())
+    verified = [event for event, sources in event_sources.items() if len(sources) >= 2]
+    if not verified:
+        return "None"
+    return ", ".join(event.replace("_", " ") for event in verified[:3])
+
+
 def score_news(items: Sequence[NewsItem]) -> Tuple[float, Dict[str, int], Dict[str, int], List[str]]:
     if not items:
         return -25.0, {}, {}, ["No fresh news found; confidence reduced."]
 
+    items = filter_news_quality(items, keep_low_quality_if_empty=True)
+    quality_score, trusted_ratio, trusted_count, low_count = news_quality_metrics(items)
+    verified_label = verified_catalyst_label(items)
     weighted_text_parts = []
     credibility_bonus = 0.0
     recency_bonus = 0.0
@@ -672,7 +952,7 @@ def score_news(items: Sequence[NewsItem]) -> Tuple[float, Dict[str, int], Dict[s
         source_weight = credibility_weight(item.source)
         recency_weight = news_recency_weight(item)
         total_weight = source_weight * recency_weight
-        weighted_text_parts.append((item.title + " ") * max(1, int(round(total_weight * 2.4))))
+        weighted_text_parts.append((news_analysis_text(item) + " ") * max(1, int(round(total_weight * 2.4))))
         credibility_bonus += min(source_weight - 0.85, 0.35) * recency_weight
         recency_bonus += max(recency_weight - 0.80, -0.35)
         source_names.add(item.source.lower().strip() or "unknown")
@@ -686,7 +966,7 @@ def score_news(items: Sequence[NewsItem]) -> Tuple[float, Dict[str, int], Dict[s
     positive_hits = count_event_hits(text, POSITIVE_EVENTS)
     negative_hits = count_event_hits(text, NEGATIVE_EVENTS)
     keyword_score = keyword_sentiment_score(text)
-    model_score = finbert_score([item.title for item in items])
+    model_score = finbert_score([news_analysis_text(item) for item in items])
 
     positive_points = sum(positive_hits.values()) * 9.0
     negative_points = sum(negative_hits.values()) * 14.0
@@ -716,6 +996,22 @@ def score_news(items: Sequence[NewsItem]) -> Tuple[float, Dict[str, int], Dict[s
     if len(source_names) < 3:
         score -= 4.0
         notes.append("News source diversity is limited.")
+    if verified_label != "None":
+        score += 12.0
+        notes.append(f"Verified catalyst across high-trust sources: {verified_label}.")
+    elif sum(positive_hits.values()) >= 2:
+        score -= 5.0
+        notes.append("Positive catalyst is not verified by multiple high-trust sources.")
+    if trusted_ratio < 0.25:
+        score -= 12.0
+        notes.append("Most headlines come from lower-trust sources; confidence reduced.")
+    elif trusted_ratio < 0.45:
+        score -= 5.0
+        notes.append("High-trust source coverage is limited.")
+    if low_count:
+        score -= min(low_count * 4.0, 12.0)
+        notes.append("Low-quality/repost-style headlines were filtered or penalized.")
+    notes.append(f"News quality score {quality_score:.1f}; trusted sources {trusted_count}/{len(items)}.")
     return float(score), positive_hits, negative_hits, notes
 
 
@@ -1001,9 +1297,9 @@ def prediction_analysis(
     )
 
     # News gets the strongest directional influence. Fundamentals matter more on the 1y horizon.
-    signal_1d = 0.58 * news_signal + 0.20 * tech_signal + 0.12 * macro_signal + 0.10 * mc_signal - neg_penalty
-    signal_1w = 0.55 * news_signal + 0.23 * tech_signal + 0.12 * macro_signal + 0.07 * mc_signal + 0.03 * fund_signal - neg_penalty
-    signal_1y = 0.38 * news_signal + 0.18 * tech_signal + 0.14 * macro_signal + 0.30 * fund_signal - neg_penalty * 0.75
+    signal_1d = 0.61 * news_signal + 0.18 * tech_signal + 0.11 * macro_signal + 0.10 * mc_signal - neg_penalty
+    signal_1w = 0.58 * news_signal + 0.21 * tech_signal + 0.11 * macro_signal + 0.07 * mc_signal + 0.03 * fund_signal - neg_penalty
+    signal_1y = 0.41 * news_signal + 0.17 * tech_signal + 0.12 * macro_signal + 0.30 * fund_signal - neg_penalty * 0.75
     signal_1d = signal_1d * conviction_multiplier + alignment_shift
     signal_1w = signal_1w * conviction_multiplier + alignment_shift
     signal_1y = signal_1y * conviction_multiplier + alignment_shift * 0.75
@@ -1134,12 +1430,386 @@ def trend_quality_score(technical: TechnicalSnapshot) -> float:
 
 def risk_keyword_count(positive_hits: Dict[str, int], negative_hits: Dict[str, int], news: Sequence[NewsItem]) -> int:
     """Detect severe small-cap/biotech style risk phrases beyond the regular dictionaries."""
-    text = clean_text(" ".join(item.title for item in news)).lower()
+    text = clean_text(" ".join(news_analysis_text(item) for item in news)).lower()
     extra_risks = [
         "dilution", "offering", "share offering", "bankruptcy", "going concern",
         "reverse split", "short report", "clinical hold", "failed trial", "fda rejection",
     ]
     return sum(negative_hits.values()) + sum(1 for phrase in extra_risks if phrase in text)
+
+
+def deep_learning_feature_vector(
+    news_score: float,
+    technical: TechnicalSnapshot,
+    fundamentals: FundamentalsSnapshot,
+    mc: MonteCarloSnapshot,
+    macro_score: float,
+    macro_risk_score: float,
+    sector_macro_score: float,
+    positive_hits: Dict[str, int],
+    negative_hits: Dict[str, int],
+    news_quality_score: float,
+) -> Dict[str, float]:
+    """Feature vector kept simple now, but ready for future online/deep learning."""
+    return {
+        "news_score": float(news_score),
+        "technical_score": float(technical.score),
+        "trend_up": 1.0 if technical.trend_label == "uptrend" else 0.0,
+        "trend_down": 1.0 if technical.trend_label == "downtrend" else 0.0,
+        "rsi": float(technical.rsi or 50.0),
+        "volume_ratio": float(technical.volume_ratio or 1.0),
+        "return_1w": float(technical.return_1w or 0.0),
+        "return_1m": float(technical.return_1m or 0.0),
+        "volatility": float(technical.volatility or 0.0),
+        "fundamentals_score": float(fundamentals.score),
+        "mc_probability_up_20d": float(mc.probability_up_20d or 0.50),
+        "mc_risk_score": float(mc.risk_score),
+        "macro_score": float(macro_score),
+        "macro_risk_score": float(macro_risk_score),
+        "sector_macro_score": float(sector_macro_score),
+        "positive_event_count": float(sum(positive_hits.values())),
+        "negative_event_count": float(sum(negative_hits.values())),
+        "news_quality_score": float(news_quality_score),
+    }
+
+
+def default_adaptive_model_state() -> Dict[str, object]:
+    return {
+        "version": 1,
+        "weights": {
+            "news": 0.25,
+            "trend": 0.18,
+            "momentum": 0.15,
+            "quality": 0.13,
+            "monteCarloRisk": 0.16,
+            "macro": 0.13,
+        },
+        "performance": {},
+        "last_updated": "",
+        "evaluated_predictions": 0,
+    }
+
+
+def load_json_file(path: str, default):
+    try:
+        if not os.path.exists(path):
+            return default
+        with open(path, "r", encoding="utf-8") as file:
+            return json.load(file)
+    except Exception:
+        return default
+
+
+def save_json_file(path: str, payload) -> None:
+    try:
+        with open(path, "w", encoding="utf-8") as file:
+            json.dump(payload, file, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def supabase_key() -> str:
+    return SUPABASE_SERVICE_ROLE_KEY or SUPABASE_ANON_KEY
+
+
+def supabase_enabled() -> bool:
+    return bool(SUPABASE_URL and supabase_key() and requests is not None)
+
+
+def supabase_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    key = supabase_key()
+    headers = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+    if extra:
+        headers.update(extra)
+    return headers
+
+
+def supabase_state_url(key: Optional[str] = None) -> str:
+    table = urllib.parse.quote(SUPABASE_STATE_TABLE, safe="")
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    if key:
+        encoded_key = urllib.parse.quote(key, safe="")
+        return f"{url}?key=eq.{encoded_key}&select=payload"
+    return f"{url}?on_conflict=key"
+
+
+def supabase_get_state(key: str):
+    """Read persistent learning state from Supabase when configured."""
+    if not supabase_enabled():
+        return None
+    try:
+        response = requests.get(supabase_state_url(key), headers=supabase_headers(), timeout=8)
+        if response.status_code >= 400:
+            return None
+        rows = response.json()
+        if isinstance(rows, list) and rows:
+            return rows[0].get("payload")
+    except Exception:
+        return None
+    return None
+
+
+def supabase_set_state(key: str, payload) -> bool:
+    """Upsert persistent learning state into Supabase without exposing keys to the frontend."""
+    if not supabase_enabled():
+        return False
+    try:
+        body = {
+            "key": key,
+            "payload": payload,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        response = requests.post(
+            supabase_state_url(),
+            headers=supabase_headers({"Prefer": "resolution=merge-duplicates,return=minimal"}),
+            json=body,
+            timeout=8,
+        )
+        return response.status_code < 400
+    except Exception:
+        return False
+
+
+def persistent_store_get(key: str, local_path: str, default):
+    """Prefer Supabase persistence, then fall back to local JSON for local/offline runs."""
+    remote_value = supabase_get_state(key)
+    if remote_value is not None:
+        return remote_value, True, "supabase"
+    local_exists = os.path.exists(local_path)
+    return load_json_file(local_path, default), local_exists, "local_json"
+
+
+def persistent_store_set(key: str, local_path: str, payload) -> str:
+    stored_remote = supabase_set_state(key, payload)
+    save_json_file(local_path, payload)
+    return "supabase" if stored_remote else "local_json"
+
+
+def load_adaptive_model_state() -> Dict[str, object]:
+    state, existed, storage = persistent_store_get(
+        "adaptive_model_state",
+        ADAPTIVE_MODEL_STATE_FILE,
+        default_adaptive_model_state(),
+    )
+    if not isinstance(state, dict) or "weights" not in state:
+        state = default_adaptive_model_state()
+        existed = False
+    default = default_adaptive_model_state()
+    weights = default["weights"].copy()
+    weights.update({k: safe_float(v, weights.get(k, 0.0)) for k, v in state.get("weights", {}).items()})
+    total = sum(max(float(v), 0.03) for v in weights.values())
+    state["weights"] = {k: max(float(v), 0.03) / total for k, v in weights.items()}
+    state.setdefault("performance", {})
+    state.setdefault("evaluated_predictions", 0)
+    state["storage"] = storage
+    if not existed:
+        save_adaptive_model_state(state)
+    return state
+
+
+def save_adaptive_model_state(state: Dict[str, object]) -> None:
+    state["last_updated"] = datetime.now(timezone.utc).isoformat()
+    state["storage"] = persistent_store_set("adaptive_model_state", ADAPTIVE_MODEL_STATE_FILE, state)
+
+
+def normalize_model_weights(weights: Dict[str, float]) -> Dict[str, float]:
+    clipped = {key: clamp(float(value), 0.05, 0.38) for key, value in weights.items()}
+    total = sum(clipped.values()) or 1.0
+    return {key: value / total for key, value in clipped.items()}
+
+
+def prediction_log_entries() -> List[Dict[str, object]]:
+    entries, _, _ = persistent_store_get("prediction_log", PREDICTION_LOG_FILE, [])
+    return entries if isinstance(entries, list) else []
+
+
+def save_prediction_log_entries(entries: List[Dict[str, object]]) -> None:
+    persistent_store_set("prediction_log", PREDICTION_LOG_FILE, entries)
+
+
+def get_actual_price_on_or_after(ticker: str, target_date: datetime) -> Optional[float]:
+    if yf is None or pd is None:
+        return None
+    try:
+        start = target_date.strftime("%Y-%m-%d")
+        end = (target_date + timedelta(days=7)).strftime("%Y-%m-%d")
+        data = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True)
+        if data is None or data.empty:
+            return None
+        data = data.copy()
+        data.columns = [c[0] if isinstance(c, tuple) else c for c in data.columns]
+        close = to_series(data["Close"]).dropna()
+        if close.empty:
+            return None
+        return safe_float(close.iloc[0])
+    except Exception:
+        return None
+
+
+def evaluate_due_predictions() -> Dict[str, object]:
+    """Compare predictions older than 7 days with actual prices and gently update model weights."""
+    entries = prediction_log_entries()
+    if not entries:
+        return {"evaluatedNow": 0, "message": "No prediction history yet."}
+    state = load_adaptive_model_state()
+    weights = dict(state.get("weights", default_adaptive_model_state()["weights"]))
+    evaluated_now = 0
+    total_error = 0.0
+    now = datetime.now(timezone.utc)
+
+    for entry in entries:
+        if entry.get("evaluated"):
+            continue
+        try:
+            created = datetime.fromisoformat(str(entry.get("created_at")).replace("Z", "+00:00"))
+            if now - created < timedelta(days=7):
+                continue
+            ticker = str(entry.get("ticker", "")).upper()
+            target_date = created + timedelta(days=7)
+            actual_price = get_actual_price_on_or_after(ticker, target_date)
+            predicted_price = safe_float(entry.get("prediction_1w_price"))
+            start_price = safe_float(entry.get("start_price"))
+            if actual_price is None or predicted_price is None or start_price is None or start_price <= 0:
+                continue
+            predicted_return = predicted_price / start_price - 1.0
+            actual_return = actual_price / start_price - 1.0
+            error = abs(predicted_return - actual_return)
+            direction_hit = (predicted_return >= 0) == (actual_return >= 0)
+            entry["evaluated"] = True
+            entry["actual_1w_price"] = actual_price
+            entry["actual_1w_return"] = actual_return
+            entry["prediction_error"] = error
+            entry["direction_hit"] = direction_hit
+            evaluated_now += 1
+            total_error += error
+
+            model_signals = entry.get("model_signals", {})
+            if isinstance(model_signals, dict):
+                for name, signal in model_signals.items():
+                    signal_value = safe_float(signal, 0.0) or 0.0
+                    model_direction_hit = (signal_value >= 0) == (actual_return >= 0)
+                    adjustment = 0.012 if model_direction_hit else -0.010
+                    if error > 0.12:
+                        adjustment *= 1.4
+                    weights[name] = float(weights.get(name, 0.12)) + adjustment
+        except Exception:
+            continue
+
+    if evaluated_now:
+        state["weights"] = normalize_model_weights(weights)
+        state["evaluated_predictions"] = int(state.get("evaluated_predictions", 0)) + evaluated_now
+        state["last_average_error"] = total_error / max(evaluated_now, 1)
+        save_prediction_log_entries(entries[-600:])
+        save_adaptive_model_state(state)
+    return {
+        "evaluatedNow": evaluated_now,
+        "lastAverageError": total_error / max(evaluated_now, 1) if evaluated_now else None,
+        "weights": state.get("weights", weights),
+        "storage": state.get("storage", "supabase" if supabase_enabled() else "local_json"),
+    }
+
+
+def log_prediction_result(result: "StockResult", feature_vector: Dict[str, float]) -> None:
+    """Store each forecast so future runs can evaluate 7-day prediction error."""
+    try:
+        if result.technical.price is None:
+            return
+        entries = prediction_log_entries()
+        entry = {
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "ticker": result.ticker,
+            "start_price": result.technical.price,
+            "prediction_1d_price": result.prediction.price_1d,
+            "prediction_1w_price": result.prediction.price_1w,
+            "prediction_1y_price": result.prediction.price_1y,
+            "probability_up_1w": result.prediction.probability_up_1w,
+            "final_score": result.final_score,
+            "ranking_score": result.ranking_score,
+            "action": result.action,
+            "features": feature_vector,
+            "model_signals": result.adaptive_ensemble.get("modelSignals", {}),
+            "model_weights": result.adaptive_ensemble.get("weights", {}),
+            "evaluated": False,
+        }
+        entries.append(entry)
+        save_prediction_log_entries(entries[-800:])
+    except Exception:
+        pass
+
+
+def adaptive_ensemble_simulation(features: Dict[str, float], sims: int = 700) -> Dict[str, object]:
+    """Run multiple lightweight model views and stress simulations before raising conviction."""
+    try:
+        news_model = clamp(features["news_score"] / 100.0, -1.0, 1.0)
+        trend_model = clamp(features["technical_score"] / 85.0 + features["trend_up"] * 0.20 - features["trend_down"] * 0.35, -1.0, 1.0)
+        momentum_model = clamp((features["volume_ratio"] - 1.0) * 0.22 + (0.62 - abs(features["rsi"] - 58.0) / 100.0) + features["return_1w"] * 0.8, -1.0, 1.0)
+        quality_model = clamp(features["fundamentals_score"] / 50.0 + features["news_quality_score"] / 180.0, -1.0, 1.0)
+        risk_model = clamp(features["mc_risk_score"] / 45.0 + (features["mc_probability_up_20d"] - 0.50) * 1.6, -1.0, 1.0)
+        macro_model = clamp((features["macro_score"] + features["sector_macro_score"] - features["macro_risk_score"] * 0.45) / 85.0, -1.0, 1.0)
+
+        model_signals = {
+            "news": news_model,
+            "trend": trend_model,
+            "momentum": momentum_model,
+            "quality": quality_model,
+            "monteCarloRisk": risk_model,
+            "macro": macro_model,
+        }
+        state = load_adaptive_model_state()
+        base_weights = {
+            "news": 0.25,
+            "trend": 0.18,
+            "momentum": 0.15,
+            "quality": 0.13,
+            "monteCarloRisk": 0.16,
+            "macro": 0.13,
+        }
+        learned_weights = state.get("weights", {})
+        if isinstance(learned_weights, dict):
+            base_weights.update({k: safe_float(v, base_weights.get(k, 0.0)) for k, v in learned_weights.items()})
+        if features["news_quality_score"] < 55:
+            base_weights["news"] *= 0.65
+            base_weights["trend"] *= 1.10
+            base_weights["monteCarloRisk"] *= 1.12
+        total_weight = sum(base_weights.values())
+        weights = {key: value / total_weight for key, value in base_weights.items()}
+        ensemble_signal = sum(model_signals[key] * weights[key] for key in model_signals)
+
+        if np is not None:
+            rng = np.random.default_rng(123)
+            noise_scale = 0.10 + min(features["volatility"], 1.6) * 0.06
+            simulated = rng.normal(ensemble_signal, noise_scale, sims)
+            simulated -= features["negative_event_count"] * 0.035
+            simulated -= max(features["macro_risk_score"] - 20.0, 0.0) * 0.003
+            probability = float(np.mean(simulated > 0.02))
+            stability = float(1.0 - min(np.std(simulated), 1.0))
+        else:
+            probability = probability_from_signal(ensemble_signal)
+            stability = 0.55
+        probability = clamp(probability, 0.35, 0.75)
+
+        spread = max(model_signals.values()) - min(model_signals.values())
+        disagreement = spread > 1.15 or stability < 0.45
+        policy = "Maintain current model weights"
+        if disagreement:
+            policy = "Reduce position sizing; monitor for regime shift before retraining"
+        if features["negative_event_count"] >= 3 or features["macro_risk_score"] > 35:
+            policy = "Risk-off weighting; require more confirmation"
+        return {
+            "probability": probability,
+            "ensembleSignal": float(ensemble_signal),
+            "stability": stability,
+            "modelSignals": {key: float(value) for key, value in model_signals.items()},
+            "weights": {key: float(value) for key, value in weights.items()},
+            "policy": policy,
+            "simulations": sims,
+        }
+    except Exception as exc:
+        return {"probability": 0.50, "policy": f"Adaptive ensemble unavailable: {str(exc)[:100]}", "simulations": 0}
 
 
 def compute_probability_ranking_score(
@@ -1164,7 +1834,7 @@ def compute_probability_ranking_score(
         sector_macro_score,
         macro_risk_score,
     )
-    news_component = clamp((news_score + 30.0) / 140.0, 0.0, 1.0) * 35.0
+    news_component = clamp((news_score + 30.0) / 140.0, 0.0, 1.0) * 38.0
     technical_component = clamp((technical.score + 35.0) / 120.0, 0.0, 1.0) * 18.0
     trend_component = max(0.0, trend_quality_score(technical)) / 15.0 * 15.0
     volume_component = max(0.0, volume_activity_score(technical))
@@ -1250,7 +1920,7 @@ def small_cap_catalyst_score(
     """Flag high-risk/high-reward catalyst setups, especially small-cap and biotech names."""
     try:
         market_cap = safe_float(info.get("marketCap"))
-        text = clean_text(" ".join(item.title for item in news)).lower()
+        text = clean_text(" ".join(news_analysis_text(item) for item in news)).lower()
         catalyst_terms = [
             "fda approval", "phase 2", "phase ii", "phase 3", "phase iii",
             "positive trial", "met primary endpoint", "clinical trial", "partnership",
@@ -1357,6 +2027,8 @@ def generate_recommendation_reason(result: StockResult) -> str:
     reasons = []
     if result.news_score > 25:
         reasons.append("positive catalyst news")
+    if result.verified_catalyst != "None":
+        reasons.append(f"verified catalyst ({result.verified_catalyst})")
     if result.technical.trend_label == "uptrend":
         reasons.append("strong uptrend")
     if result.technical.rsi is not None and 45 <= result.technical.rsi <= 70:
@@ -1367,6 +2039,8 @@ def generate_recommendation_reason(result: StockResult) -> str:
         reasons.append("Monte Carlo upside probability above 55%")
     if (result.technical.volume_ratio or 0.0) >= 1.2:
         reasons.append("above-average volume")
+    if result.related_tickers:
+        reasons.append("related-stock/background context was included")
     if not reasons:
         reasons.append("the setup is mixed and needs confirmation")
     risk = "medium"
@@ -1541,9 +2215,20 @@ def analyze_ticker(
     ticker = ticker.strip().upper()
     company, info = get_company_name_and_info(ticker)
     sector = SECTOR_MAP.get(ticker, "general")
+    learning_state = evaluate_due_predictions()
 
     news = collect_ticker_news(ticker, company)
+    background_news, related_tickers = collect_related_background_news(ticker, company, sector, info)
+    if background_news:
+        news = recent_first(news + background_news, limit=55, max_age_days=10)
     news_score, positive_hits, negative_hits, notes = score_news(news)
+    news_quality_score, trusted_ratio, trusted_count, low_quality_count = news_quality_metrics(news)
+    verified_catalyst = verified_catalyst_label(news)
+    background_summary = (
+        "Related context included: " + ", ".join(related_tickers[:6])
+        if related_tickers
+        else "No mapped related tickers found."
+    )
 
     macro_score, macro_risk_score, macro_pos, macro_risk = macro
     sector_macro_score = sector_macro_adjustment(sector, macro_pos, macro_risk)
@@ -1562,6 +2247,27 @@ def analyze_ticker(
         mc,
         negative_hits,
     )
+    feature_vector = deep_learning_feature_vector(
+        news_score,
+        technical,
+        fundamentals,
+        mc,
+        macro_score,
+        macro_risk_score,
+        sector_macro_score,
+        positive_hits,
+        negative_hits,
+        news_quality_score,
+    )
+    adaptive_ensemble = adaptive_ensemble_simulation(feature_vector)
+    ensemble_probability = safe_float(adaptive_ensemble.get("probability"), None)
+    if ensemble_probability is not None:
+        if prediction.probability_up_1d is not None:
+            prediction.probability_up_1d = clamp(prediction.probability_up_1d * 0.72 + ensemble_probability * 0.28, 0.35, 0.75)
+        if prediction.probability_up_1w is not None:
+            prediction.probability_up_1w = clamp(prediction.probability_up_1w * 0.65 + ensemble_probability * 0.35, 0.35, 0.75)
+        if prediction.probability_up_1y is not None:
+            prediction.probability_up_1y = clamp(prediction.probability_up_1y * 0.80 + ensemble_probability * 0.20, 0.35, 0.75)
 
     final_score, risk_penalty, bullish_reasons, bearish_reasons = compute_probability_ranking_score(
         news_score,
@@ -1608,6 +2314,15 @@ def analyze_ticker(
         history is not None,
         quality_adjustment,
     )
+    if trusted_ratio < 0.25:
+        confidence -= 12.0
+    elif trusted_ratio < 0.45:
+        confidence -= 6.0
+    if trusted_count < 2:
+        confidence -= 8.0
+    if verified_catalyst != "None":
+        confidence += 5.0
+    confidence = clamp(confidence, 5.0, 93.0)
     setup_label = detect_rising_stock_setup(technical, news_score, negative_hits, mc, sector_macro_score)
     small_score, small_risk, small_summary = small_cap_catalyst_score(
         info,
@@ -1618,6 +2333,10 @@ def analyze_ticker(
         news,
     )
     ranking_score = compute_ranking_score(final_score, confidence, setup_label, mc, technical, negative_hits)
+    if ensemble_probability is not None:
+        ranking_score += (ensemble_probability - 0.50) * 18.0
+        if adaptive_ensemble.get("stability", 1.0) < 0.45:
+            ranking_score -= 6.0
     estimated_upside_probability = prediction.probability_up_1w or prediction.probability_up_1d or mc.probability_up_20d
     action = action_from_score(final_score, confidence, negative_hits, technical, news_score, mc)
 
@@ -1641,6 +2360,12 @@ def analyze_ticker(
         small_cap_catalyst_score=small_score,
         small_cap_risk_level=small_risk,
         small_cap_summary=small_summary,
+        verified_catalyst=verified_catalyst,
+        news_quality_score=news_quality_score,
+        related_tickers=related_tickers,
+        background_summary=background_summary,
+        adaptive_ensemble=adaptive_ensemble,
+        learning_state=learning_state,
         suggested_entry_style=suggested_entry_style(setup_label, technical),
         backtest=backtest_strategy(ticker, history),
         positive_hits=positive_hits,
@@ -1656,6 +2381,7 @@ def analyze_ticker(
     result.recommendation_reason = generate_recommendation_reason(result)
     result.main_risk_warning = main_risk_warning_from_components(result)
     result.risk_management = risk_management_suggestion(result)
+    log_prediction_result(result, feature_vector)
     return result
 
 
@@ -1785,6 +2511,12 @@ def print_result(result: StockResult, rank: int) -> None:
     print(f"  Sector macro          : {result.sector_macro_score:.1f}")
     print(f"  Small-cap catalyst    : {result.small_cap_catalyst_score:.1f}")
     print(f"  Small-cap risk level  : {result.small_cap_risk_level}")
+    print(f"  News quality          : {result.news_quality_score:.1f}")
+    print(f"  Verified catalyst     : {result.verified_catalyst}")
+    if result.adaptive_ensemble:
+        ensemble_prob = result.adaptive_ensemble.get("probability")
+        ensemble_stability = result.adaptive_ensemble.get("stability")
+        print(f"  Adaptive ensemble     : {ensemble_prob * 100:.1f}% prob / stability {ensemble_stability:.2f}" if isinstance(ensemble_prob, float) and isinstance(ensemble_stability, float) else "  Adaptive ensemble     : N/A")
 
     print("\nFORECAST")
     print("  Horizon | Predicted price | Expected return | Chance up")
@@ -1811,6 +2543,10 @@ def print_result(result: StockResult, rank: int) -> None:
     print("  Negative:", result.negative_hits or "none")
     print("\nWHY THIS STOCK?")
     print(f"  {result.recommendation_reason}")
+    print("\nRELATED / BACKGROUND CONTEXT")
+    print(f"  {result.background_summary}")
+    if result.adaptive_ensemble:
+        print(f"  Ensemble policy: {result.adaptive_ensemble.get('policy', 'N/A')}")
     print("\nMAIN RISK WARNING")
     print(f"  {result.main_risk_warning}")
     if result.small_cap_summary != "N/A":

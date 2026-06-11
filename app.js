@@ -35,9 +35,15 @@ const translations = {
     mc: "MC",
     smallCap: "Small-cap Catalyst",
     smallCapRisk: "Small-cap Risk",
+    newsQuality: "News Quality",
+    verifiedCatalyst: "Verified Catalyst",
+    relatedContext: "Related Context",
+    adaptivePolicy: "Adaptive Ensemble",
+    learningLoop: "Learning Loop",
     whyThis: "Why This Stock?",
     riskWarning: "Main Risk Warning",
     riskManagement: "Risk Management",
+    summary: "Summary",
     errorFallback: "Analysis failed",
     apiHint: "Set window.NEWS_QUANT_API_BASE_URL in config.js when this static app is hosted separately.",
   },
@@ -77,9 +83,15 @@ const translations = {
     mc: "MC",
     smallCap: "소형주 촉매",
     smallCapRisk: "소형주 리스크",
+    newsQuality: "뉴스 품질",
+    verifiedCatalyst: "검증된 촉매",
+    relatedContext: "관련 배경",
+    adaptivePolicy: "적응형 앙상블",
+    learningLoop: "학습 루프",
     whyThis: "왜 이 종목인가?",
     riskWarning: "주요 리스크",
     riskManagement: "리스크 관리",
+    summary: "요약",
     errorFallback: "분석 실패",
     apiHint: "정적 앱을 따로 호스팅할 때 config.js에 window.NEWS_QUANT_API_BASE_URL을 설정하세요.",
   },
@@ -230,6 +242,25 @@ function fallbackSmallCapRisk(row) {
   return "Low";
 }
 
+function fallbackNewsQuality(row) {
+  const sources = (row.headlines || []).map((item) => String(item.source || "").toLowerCase());
+  if (!sources.length) return 40;
+  const trusted = sources.filter((source) =>
+    ["reuters", "bloomberg", "associated press", "ap", "wall street journal", "cnbc", "marketwatch", "yahoo finance", "sec"].some((name) => source.includes(name))
+  ).length;
+  return Math.min(100, 45 + (trusted / sources.length) * 45 + Math.min(sources.length, 6) * 2);
+}
+
+function fallbackVerifiedCatalyst(row) {
+  if (row.verifiedCatalyst && row.verifiedCatalyst !== "N/A") return row.verifiedCatalyst;
+  const trustedHeadlines = (row.headlines || []).filter((item) => {
+    const source = String(item.source || "").toLowerCase();
+    return ["reuters", "bloomberg", "associated press", "ap", "wall street journal", "cnbc", "marketwatch", "yahoo finance", "sec"].some((name) => source.includes(name));
+  });
+  if (trustedHeadlines.length >= 2 && safeNumber(row.newsScore) > 20) return "High-trust catalyst coverage";
+  return "None";
+}
+
 function fallbackReason(row, setup) {
   const reasons = [];
   if (safeNumber(row.newsScore) > 15) reasons.push("recent catalyst news");
@@ -292,6 +323,8 @@ function hydrateResult(row) {
     estimatedUpsideProbability,
     smallCapCatalystScore: smallCapScore,
     smallCapRiskLevel: smallCapRisk,
+    newsQualityScore: isFiniteNumber(row.newsQualityScore) ? row.newsQualityScore : fallbackNewsQuality(row),
+    verifiedCatalyst: fallbackVerifiedCatalyst(row),
     recommendationReason: hasRealText(row.recommendationReason) ? row.recommendationReason : fallbackReason(row, setup),
     mainRiskWarning: hasRealText(row.mainRiskWarning) ? row.mainRiskWarning : fallbackRiskWarning(row, smallCapRisk),
     suggestedEntryStyle: hasRealText(row.suggestedEntryStyle) ? row.suggestedEntryStyle : fallbackEntryStyle(setup),
@@ -345,6 +378,7 @@ function renderMacro(data) {
         ${macro.headlines.map((item) => `
           <li>
             ${item.url ? `<a href="${escapeHtml(item.url)}" target="_blank" rel="noreferrer">${escapeHtml(item.title)}</a>` : `<span>${escapeHtml(item.title)}</span>`}
+            ${item.summary ? `<p class="headline-summary">${escapeHtml(item.summary)}</p>` : ""}
             <div class="source">${escapeHtml(item.source)}</div>
           </li>
         `).join("")}
@@ -389,8 +423,15 @@ function renderResult(rawRow) {
       <div class="score-grid">
         <div class="metric"><span>${t("price")}</span><strong>${money(row.technical.price)}</strong></div>
         <div class="metric"><span>${t("newsScore")}</span><strong>${num(row.newsScore)}</strong></div>
+        <div class="metric"><span>${t("newsQuality")}</span><strong>${num(row.newsQualityScore)}</strong></div>
+        <div class="metric"><span>${t("verifiedCatalyst")}</span><strong>${escapeHtml(row.verifiedCatalyst || "None")}</strong></div>
+      </div>
+
+      <div class="score-grid">
         <div class="metric"><span>${t("smallCap")}</span><strong>${num(row.smallCapCatalystScore)}</strong></div>
         <div class="metric"><span>${t("smallCapRisk")}</span><strong>${escapeHtml(row.smallCapRiskLevel || "Low")}</strong></div>
+        <div class="metric"><span>${t("pullback")}</span><strong>${escapeHtml(trPhrase(row.technical.pullbackLabel))}</strong></div>
+        <div class="metric"><span>${t("monteCarlo")}</span><strong>${pct(row.monteCarlo.probabilityUp20d)}</strong></div>
       </div>
 
       <div class="meta">
@@ -407,6 +448,21 @@ function renderResult(rawRow) {
       </div>
 
       <div class="metric narrative">
+        <span>${t("relatedContext")}</span>
+        <p>${escapeHtml(row.backgroundSummary || "Related background context unavailable.")}</p>
+      </div>
+
+      <div class="metric narrative">
+        <span>${t("adaptivePolicy")}</span>
+        <p>${escapeHtml(row.adaptiveEnsemble?.policy || "Maintain current model weights")} · Sim prob ${pct(row.adaptiveEnsemble?.probability)} · Stability ${num(row.adaptiveEnsemble?.stability, 2)}</p>
+      </div>
+
+      <div class="metric narrative">
+        <span>${t("learningLoop")}</span>
+        <p>Evaluated now: ${escapeHtml(row.learningState?.evaluatedNow ?? 0)} · Avg error: ${row.learningState?.lastAverageError == null ? "Waiting for 7-day results" : pct(row.learningState.lastAverageError)}</p>
+      </div>
+
+      <div class="metric narrative">
         <span>${t("riskWarning")}</span>
         <p>${escapeHtml(row.mainRiskWarning || fallbackRiskWarning(row, row.smallCapRiskLevel))}</p>
       </div>
@@ -420,6 +476,7 @@ function renderResult(rawRow) {
         ${row.headlines.slice(0, 5).map((item) => `
           <li>
             ${item.url ? `<a href="${escapeHtml(item.url)}" target="_blank" rel="noreferrer">${escapeHtml(item.title)}</a>` : `<span>${escapeHtml(item.title)}</span>`}
+            ${item.summary ? `<p class="headline-summary">${escapeHtml(item.summary)}</p>` : ""}
             <div class="source">${escapeHtml(item.source)}</div>
           </li>
         `).join("")}
