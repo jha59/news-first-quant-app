@@ -298,6 +298,20 @@ h1 {
   font-weight: 950;
 }
 
+.best-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  border: 1px solid rgba(130, 224, 170, 0.55);
+  border-radius: 999px;
+  padding: 4px 9px;
+  color: #102219;
+  background: linear-gradient(135deg, #8be4ad, #7cd7f2);
+  font-size: 11px;
+  font-weight: 950;
+  margin-bottom: 7px;
+}
+
 .company {
   color: var(--muted);
   font-size: 13px;

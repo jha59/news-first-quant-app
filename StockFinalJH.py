@@ -1991,21 +1991,51 @@ def compute_ranking_score(
     setup_label: str,
     mc: MonteCarloSnapshot,
     technical: TechnicalSnapshot,
+    prediction: PredictionSnapshot,
     negative_hits: Dict[str, int],
+    bullish_count: int = 0,
+    bearish_count: int = 0,
 ) -> float:
+    """Rank broad-scan candidates by signal alignment, upside odds, and realistic upside."""
     setup_bonus = {
-        "Healthy Pullback Buy Setup": 14.0,
-        "Momentum Breakout Setup": 12.0,
-        "Early Bullish Setup": 8.0,
-        "Overextended / Wait": -12.0,
-        "Bearish / Avoid": -25.0,
+        "Healthy Pullback Buy Setup": 18.0,
+        "Momentum Breakout Setup": 17.0,
+        "Early Bullish Setup": 11.0,
+        "Overextended / Wait": -20.0,
+        "Bearish / Avoid": -35.0,
     }.get(setup_label, 0.0)
-    mc_bonus = ((mc.probability_up_20d or 0.50) - 0.50) * 40.0
-    volume_bonus = 5.0 if 1.2 <= (technical.volume_ratio or 0.0) <= 3.5 else 0.0
-    risk_penalty = sum(negative_hits.values()) * 5.0
+    mc_bonus = ((mc.probability_up_20d or 0.50) - 0.50) * 55.0
+    probability_bonus = ((prediction.probability_up_1w or mc.probability_up_20d or 0.50) - 0.50) * 70.0
+    upside_1w = clamp(prediction.expected_return_1w or 0.0, -0.20, 0.30)
+    upside_1y = clamp(prediction.expected_return_1y or 0.0, -0.45, 1.20)
+    upside_bonus = max(0.0, upside_1w) * 45.0 + max(0.0, upside_1y) * 10.0
+    alignment_bonus = max(0, bullish_count - 3) * 4.0
+    if bullish_count >= 6 and bearish_count <= 1:
+        alignment_bonus += 16.0
+    elif bullish_count >= 5 and bearish_count <= 2:
+        alignment_bonus += 10.0
+    conflict_penalty = max(0, bearish_count) * 7.0
+    volume_bonus = 7.0 if 1.2 <= (technical.volume_ratio or 0.0) <= 3.5 else 0.0
+    risk_penalty = sum(negative_hits.values()) * 6.0 + conflict_penalty
     if technical.pullback_label == "extended / chased":
-        risk_penalty += 10.0
-    return float(final_score + confidence * 0.30 + setup_bonus + mc_bonus + volume_bonus - risk_penalty)
+        risk_penalty += 18.0
+    if technical.trend_label == "downtrend":
+        risk_penalty += 18.0
+    if (technical.return_1w or 0.0) >= 0.20 or (technical.return_1m or 0.0) >= 0.45:
+        risk_penalty += 12.0
+    if (technical.volatility or 0.0) >= 0.95:
+        risk_penalty += 8.0
+    return float(
+        final_score
+        + confidence * 0.28
+        + setup_bonus
+        + mc_bonus
+        + probability_bonus
+        + upside_bonus
+        + alignment_bonus
+        + volume_bonus
+        - risk_penalty
+    )
 
 
 def main_risk_warning_from_components(result: StockResult) -> str:
@@ -2332,7 +2362,27 @@ def analyze_ticker(
         negative_hits,
         news,
     )
-    ranking_score = compute_ranking_score(final_score, confidence, setup_label, mc, technical, negative_hits)
+    bullish_count, bearish_count, _, _ = bullish_bearish_signal_counts(
+        news_score,
+        positive_hits,
+        negative_hits,
+        technical,
+        fundamentals,
+        mc,
+        sector_macro_score,
+        macro_risk_score,
+    )
+    ranking_score = compute_ranking_score(
+        final_score,
+        confidence,
+        setup_label,
+        mc,
+        technical,
+        prediction,
+        negative_hits,
+        bullish_count,
+        bearish_count,
+    )
     if ensemble_probability is not None:
         ranking_score += (ensemble_probability - 0.50) * 18.0
         if adaptive_ensemble.get("stability", 1.0) < 0.45:

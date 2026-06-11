@@ -37,6 +37,7 @@ const translations = {
     smallCapRisk: "Small-cap Risk",
     newsQuality: "News Quality",
     verifiedCatalyst: "Verified Catalyst",
+    bestCandidate: "Best match",
     relatedContext: "Related Context",
     adaptivePolicy: "Adaptive Ensemble",
     learningLoop: "Learning Loop",
@@ -85,6 +86,7 @@ const translations = {
     smallCapRisk: "소형주 리스크",
     newsQuality: "뉴스 품질",
     verifiedCatalyst: "검증된 촉매",
+    bestCandidate: "최우선 후보",
     relatedContext: "관련 배경",
     adaptivePolicy: "적응형 앙상블",
     learningLoop: "학습 루프",
@@ -222,15 +224,29 @@ function fallbackRankingScore(row, setup) {
   const finalScore = safeNumber(row.finalScore);
   const confidence = safeNumber(row.confidence);
   const mcUp = safeNumber(row.monteCarlo?.probabilityUp20d, row.prediction?.probabilityUp1w, 0.5);
+  const probUp = safeNumber(row.prediction?.probabilityUp1w, row.monteCarlo?.probabilityUp20d, 0.5);
+  const upside1w = Math.max(0, Math.min(0.3, safeNumber(row.prediction?.expectedReturn1w)));
+  const upside1y = Math.max(0, Math.min(1.2, safeNumber(row.prediction?.expectedReturn1y)));
+  const volumeRatio = safeNumber(row.technical?.volumeRatio, 1);
   const negCount = Object.values(row.negativeHits || {}).reduce((sum, value) => sum + safeNumber(value), 0);
   const setupBonus = {
-    "Healthy Pullback Buy Setup": 14,
-    "Momentum Breakout Setup": 12,
-    "Early Bullish Setup": 8,
-    "Overextended / Wait": -12,
-    "Bearish / Avoid": -25,
+    "Healthy Pullback Buy Setup": 18,
+    "Momentum Breakout Setup": 17,
+    "Early Bullish Setup": 11,
+    "Overextended / Wait": -20,
+    "Bearish / Avoid": -35,
   }[setup] || 0;
-  return finalScore + confidence * 0.3 + setupBonus + (mcUp - 0.5) * 40 - negCount * 5;
+  let alignment = 0;
+  if (safeNumber(row.newsScore) > 28) alignment += 4;
+  if (row.technical?.trendLabel === "uptrend") alignment += 5;
+  if (safeNumber(row.technical?.rsi, 50) >= 45 && safeNumber(row.technical?.rsi, 50) <= 70) alignment += 3;
+  if (volumeRatio >= 1.2 && volumeRatio <= 3.5) alignment += 7;
+  if (mcUp >= 0.55) alignment += 5;
+  if (safeNumber(row.sectorMacroScore) > 0) alignment += 3;
+  let riskPenalty = negCount * 6;
+  if (row.technical?.trendLabel === "downtrend") riskPenalty += 18;
+  if (safeNumber(row.technical?.return1w) >= 0.2 || safeNumber(row.technical?.return1m) >= 0.45) riskPenalty += 12;
+  return finalScore + confidence * 0.28 + setupBonus + (mcUp - 0.5) * 55 + (probUp - 0.5) * 70 + upside1w * 45 + upside1y * 10 + alignment - riskPenalty;
 }
 
 function fallbackSmallCapRisk(row) {
@@ -390,10 +406,13 @@ function renderMacro(data) {
 function renderResult(rawRow) {
   const row = hydrateResult(rawRow);
   const actionClass = scoreClass(row.finalScore);
+  const showBestBadge = latestData?.mode === "scan" && row.rank === 1;
+  const bestBadge = showBestBadge ? `<span class="best-badge">${t("bestCandidate")}</span>` : "";
   return `
     <article class="stock-card">
       <div class="stock-head">
         <div>
+          ${bestBadge}
           <div class="ticker">${escapeHtml(row.ticker)}</div>
           <div class="company">${escapeHtml(row.company)}</div>
         </div>
