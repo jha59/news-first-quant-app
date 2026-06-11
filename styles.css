@@ -286,6 +286,40 @@ h1 {
   line-height: 1.45;
 }
 
+.tab-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.tab-button {
+  min-height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px 10px;
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.tab-button.active {
+  border-color: rgba(124, 215, 242, 0.6);
+  background: rgba(124, 215, 242, 0.14);
+  color: #eefbf4;
+}
+
+.tab-panel {
+  display: none;
+}
+
+.tab-panel.active {
+  display: block;
+}
+
 .stock-head {
   display: flex;
   align-items: flex-start;

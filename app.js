@@ -46,6 +46,11 @@ const translations = {
     newsImpact: "News Impact",
     portfolioAllocation: "Portfolio Allocation",
     walkForward: "Walk-forward Backtest",
+    overviewTab: "Overview",
+    signalsTab: "Signals",
+    institutionalTab: "Institutional",
+    riskTab: "Risk",
+    newsTab: "News",
     whyThis: "Why This Stock?",
     riskWarning: "Main Risk Warning",
     riskManagement: "Risk Management",
@@ -100,6 +105,11 @@ const translations = {
     newsImpact: "뉴스 영향",
     portfolioAllocation: "포트폴리오 배분",
     walkForward: "워크포워드 백테스트",
+    overviewTab: "개요",
+    signalsTab: "신호",
+    institutionalTab: "기관급",
+    riskTab: "리스크",
+    newsTab: "뉴스",
     whyThis: "왜 이 종목인가?",
     riskWarning: "주요 리스크",
     riskManagement: "리스크 관리",
@@ -262,10 +272,22 @@ function fallbackRankingScore(row, setup) {
 function fallbackSmallCapRisk(row) {
   const volatility = safeNumber(row.technical?.volatility);
   const negCount = Object.values(row.negativeHits || {}).reduce((sum, value) => sum + safeNumber(value), 0);
+  const score = safeNumber(row.smallCapCatalystScore);
+  const largeCapLike = ["mega_tech", "ai_semis", "payments", "consumer_quality", "financials", "managed_care"].includes(row.sector);
+  if (largeCapLike && score < 10) return "Low";
+  if (score < 5 && negCount < 3 && volatility < 0.75) return "Low";
   if (negCount >= 5 || volatility > 0.95) return "Extreme";
-  if (negCount >= 2 || volatility > 0.7) return "High";
-  if (volatility > 0.45 || safeNumber(row.smallCapCatalystScore) > 35) return "Medium";
+  if ((negCount >= 2 && score >= 20) || volatility > 0.7) return "High";
+  if (volatility > 0.45 || score > 35 || negCount >= 2) return "Medium";
   return "Low";
+}
+
+function normalizeSmallCapRisk(row, risk) {
+  const score = safeNumber(row.smallCapCatalystScore);
+  const largeCapLike = ["mega_tech", "ai_semis", "payments", "consumer_quality", "financials", "managed_care"].includes(row.sector);
+  if (largeCapLike && score < 10) return "Low";
+  if ((risk === "High" || risk === "Extreme") && score < 5 && safeNumber(row.technical?.volatility) < 0.75) return "Low";
+  return risk;
 }
 
 function fallbackNewsQuality(row) {
@@ -300,9 +322,10 @@ function fallbackReason(row, setup) {
 
 function fallbackRiskWarning(row, smallCapRisk) {
   const negCount = Object.values(row.negativeHits || {}).reduce((sum, value) => sum + safeNumber(value), 0);
+  const catalystRisk = safeNumber(row.smallCapCatalystScore) > 20;
   if (negCount >= 3) return "Negative headline risk is elevated; wait for confirmation.";
   if (row.technical?.trendLabel === "downtrend") return "Trend is down, so positive news needs price confirmation.";
-  if (smallCapRisk === "High" || smallCapRisk === "Extreme") return "Catalyst and volatility risk are high; use smaller sizing.";
+  if (catalystRisk && (smallCapRisk === "High" || smallCapRisk === "Extreme")) return "Catalyst and volatility risk are high; use smaller sizing.";
   if (safeNumber(row.technical?.volatility) > 0.7) return "Volatility is elevated; risk controls matter more than usual.";
   return "No single dominant risk, but news and market conditions can change quickly.";
 }
@@ -333,7 +356,8 @@ function hydrateResult(row) {
     0.5
   );
   const smallCapScore = safeNumber(row.smallCapCatalystScore);
-  const smallCapRisk = hasRealText(row.smallCapRiskLevel) ? row.smallCapRiskLevel : fallbackSmallCapRisk({ ...row, smallCapCatalystScore: smallCapScore });
+  const rawSmallCapRisk = hasRealText(row.smallCapRiskLevel) ? row.smallCapRiskLevel : fallbackSmallCapRisk({ ...row, smallCapCatalystScore: smallCapScore });
+  const smallCapRisk = normalizeSmallCapRisk({ ...row, smallCapCatalystScore: smallCapScore }, rawSmallCapRisk);
   const fallbackRisk = fallbackRiskManagement(row);
   const riskManagement = row.riskManagement && Object.keys(row.riskManagement).length
     ? {
@@ -418,6 +442,7 @@ function renderResult(rawRow) {
   const actionClass = scoreClass(row.finalScore);
   const showBestBadge = latestData?.mode === "scan" && row.rank === 1;
   const bestBadge = showBestBadge ? `<span class="best-badge">${t("bestCandidate")}</span>` : "";
+  const cardId = `card-${escapeHtml(row.ticker)}-${escapeHtml(row.rank ?? 0)}`;
   return `
     <article class="stock-card">
       <div class="stock-head">
@@ -436,33 +461,6 @@ function renderResult(rawRow) {
         <div class="metric"><span>${t("upsideProb")}</span><strong>${pct(row.estimatedUpsideProbability)}</strong></div>
       </div>
 
-      <div class="forecast-grid">
-        <div class="metric"><span>${t("oneDay")}</span><strong>${money(row.prediction.price1d)}</strong><span>${pct(row.prediction.expectedReturn1d, true)} / ${t("up")} ${pct(row.prediction.probabilityUp1d)}</span></div>
-        <div class="metric"><span>${t("oneWeek")}</span><strong>${money(row.prediction.price1w)}</strong><span>${pct(row.prediction.expectedReturn1w, true)} / ${t("up")} ${pct(row.prediction.probabilityUp1w)}</span></div>
-        <div class="metric"><span>${t("oneYear")}</span><strong>${money(row.prediction.price1y)}</strong><span>${pct(row.prediction.expectedReturn1y, true)} / ${t("up")} ${pct(row.prediction.probabilityUp1y)}</span></div>
-      </div>
-
-      <div class="score-grid">
-        <div class="metric"><span>${t("setup")}</span><strong>${escapeHtml(trPhrase(row.risingSetupLabel))}</strong></div>
-        <div class="metric"><span>${t("entryStyle")}</span><strong>${escapeHtml(row.suggestedEntryStyle || "Wait for better entry")}</strong></div>
-        <div class="metric"><span>${t("trend")}</span><strong>${escapeHtml(trPhrase(row.technical.trendLabel))}</strong></div>
-        <div class="metric"><span>RSI</span><strong>${num(row.technical.rsi)}</strong></div>
-      </div>
-
-      <div class="score-grid">
-        <div class="metric"><span>${t("price")}</span><strong>${money(row.technical.price)}</strong></div>
-        <div class="metric"><span>${t("newsScore")}</span><strong>${num(row.newsScore)}</strong></div>
-        <div class="metric"><span>${t("newsQuality")}</span><strong>${num(row.newsQualityScore)}</strong></div>
-        <div class="metric"><span>${t("verifiedCatalyst")}</span><strong>${escapeHtml(row.verifiedCatalyst || "None")}</strong></div>
-      </div>
-
-      <div class="score-grid">
-        <div class="metric"><span>${t("smallCap")}</span><strong>${num(row.smallCapCatalystScore)}</strong></div>
-        <div class="metric"><span>${t("smallCapRisk")}</span><strong>${escapeHtml(row.smallCapRiskLevel || "Low")}</strong></div>
-        <div class="metric"><span>${t("pullback")}</span><strong>${escapeHtml(trPhrase(row.technical.pullbackLabel))}</strong></div>
-        <div class="metric"><span>${t("monteCarlo")}</span><strong>${pct(row.monteCarlo.probabilityUp20d)}</strong></div>
-      </div>
-
       <div class="meta">
         <span class="pill">${t("sector")} ${escapeHtml(row.sector)}</span>
         <span class="pill">${t("tech")} ${num(row.technical.score)}</span>
@@ -471,62 +469,98 @@ function renderResult(rawRow) {
         <span class="pill">Vol ${num(row.technical.volumeRatio)}x</span>
       </div>
 
-      <div class="metric narrative">
-        <span>${t("whyThis")}</span>
-        <p>${escapeHtml(row.recommendationReason || fallbackReason(row, row.risingSetupLabel))}</p>
+      <div class="tab-bar" role="tablist" aria-label="${escapeHtml(row.ticker)} sections">
+        <button class="tab-button active" type="button" data-card="${cardId}" data-tab="overview">${t("overviewTab")}</button>
+        <button class="tab-button" type="button" data-card="${cardId}" data-tab="signals">${t("signalsTab")}</button>
+        <button class="tab-button" type="button" data-card="${cardId}" data-tab="institutional">${t("institutionalTab")}</button>
+        <button class="tab-button" type="button" data-card="${cardId}" data-tab="risk">${t("riskTab")}</button>
+        <button class="tab-button" type="button" data-card="${cardId}" data-tab="news">${t("newsTab")}</button>
       </div>
 
-      <div class="metric narrative">
-        <span>${t("relatedContext")}</span>
-        <p>${escapeHtml(row.backgroundSummary || "Related background context unavailable.")}</p>
-      </div>
+      <section class="tab-panel active" data-card="${cardId}" data-panel="overview">
+        <div class="forecast-grid">
+          <div class="metric"><span>${t("oneDay")}</span><strong>${money(row.prediction.price1d)}</strong><span>${pct(row.prediction.expectedReturn1d, true)} / ${t("up")} ${pct(row.prediction.probabilityUp1d)}</span></div>
+          <div class="metric"><span>${t("oneWeek")}</span><strong>${money(row.prediction.price1w)}</strong><span>${pct(row.prediction.expectedReturn1w, true)} / ${t("up")} ${pct(row.prediction.probabilityUp1w)}</span></div>
+          <div class="metric"><span>${t("oneYear")}</span><strong>${money(row.prediction.price1y)}</strong><span>${pct(row.prediction.expectedReturn1y, true)} / ${t("up")} ${pct(row.prediction.probabilityUp1y)}</span></div>
+        </div>
+        <div class="metric narrative">
+          <span>${t("whyThis")}</span>
+          <p>${escapeHtml(row.recommendationReason || fallbackReason(row, row.risingSetupLabel))}</p>
+        </div>
+      </section>
 
-      <div class="metric narrative">
-        <span>${t("adaptivePolicy")}</span>
-        <p>${escapeHtml(row.adaptiveEnsemble?.policy || "Maintain current model weights")} · Sim prob ${pct(row.adaptiveEnsemble?.probability)} · Stability ${num(row.adaptiveEnsemble?.stability, 2)}</p>
-      </div>
+      <section class="tab-panel" data-card="${cardId}" data-panel="signals">
+        <div class="score-grid">
+          <div class="metric"><span>${t("setup")}</span><strong>${escapeHtml(trPhrase(row.risingSetupLabel))}</strong></div>
+          <div class="metric"><span>${t("entryStyle")}</span><strong>${escapeHtml(row.suggestedEntryStyle || "Wait for better entry")}</strong></div>
+          <div class="metric"><span>${t("trend")}</span><strong>${escapeHtml(trPhrase(row.technical.trendLabel))}</strong></div>
+          <div class="metric"><span>RSI</span><strong>${num(row.technical.rsi)}</strong></div>
+        </div>
+        <div class="score-grid">
+          <div class="metric"><span>${t("price")}</span><strong>${money(row.technical.price)}</strong></div>
+          <div class="metric"><span>${t("newsScore")}</span><strong>${num(row.newsScore)}</strong></div>
+          <div class="metric"><span>${t("newsQuality")}</span><strong>${num(row.newsQualityScore)}</strong></div>
+          <div class="metric"><span>${t("verifiedCatalyst")}</span><strong>${escapeHtml(row.verifiedCatalyst || "None")}</strong></div>
+        </div>
+        <div class="score-grid">
+          <div class="metric"><span>${t("smallCap")}</span><strong>${num(row.smallCapCatalystScore)}</strong></div>
+          <div class="metric"><span>${t("smallCapRisk")}</span><strong>${escapeHtml(row.smallCapRiskLevel || "Low")}</strong></div>
+          <div class="metric"><span>${t("pullback")}</span><strong>${escapeHtml(trPhrase(row.technical.pullbackLabel))}</strong></div>
+          <div class="metric"><span>${t("monteCarlo")}</span><strong>${pct(row.monteCarlo.probabilityUp20d)}</strong></div>
+        </div>
+        <div class="metric narrative">
+          <span>${t("relatedContext")}</span>
+          <p>${escapeHtml(row.backgroundSummary || "Related background context unavailable.")}</p>
+        </div>
+      </section>
 
-      <div class="metric narrative">
-        <span>${t("learningLoop")}</span>
-        <p>Evaluated now: ${escapeHtml(row.learningState?.evaluatedNow ?? 0)} · Avg error: ${row.learningState?.lastAverageError == null ? "Waiting for 7-day results" : pct(row.learningState.lastAverageError)}</p>
-      </div>
+      <section class="tab-panel" data-card="${cardId}" data-panel="institutional">
+        <div class="metric narrative">
+          <span>${t("institutionalLayer")}</span>
+          <p>Quality ${num(row.institutionalChecks?.qualityScore)} · Passed ${escapeHtml(row.institutionalChecks?.passedChecks ?? 0)} checks · ${escapeHtml((row.institutionalChecks?.riskFlags || []).join(", ") || "No major proxy flags")}</p>
+        </div>
+        <div class="score-grid">
+          <div class="metric"><span>${t("marketRegime")}</span><strong>${escapeHtml(row.marketRegime?.label || "Not enough data")}</strong><span>Risk-on ${num(row.marketRegime?.riskOnScore)}</span></div>
+          <div class="metric"><span>${t("newsImpact")}</span><strong>${escapeHtml(row.newsImpact?.label || "Not enough data")}</strong><span>Fresh ${num(row.newsImpact?.freshnessScore)} · trusted ${escapeHtml(row.newsImpact?.trustedRecentCount ?? 0)}</span></div>
+          <div class="metric"><span>Priced-in</span><strong>${escapeHtml(row.pricedIn?.label || "Not enough data")}</strong><span>Penalty ${num(row.pricedIn?.penalty)}</span></div>
+          <div class="metric"><span>${t("portfolioAllocation")}</span><strong>${escapeHtml(row.portfolioAllocation?.bucket || "Very Small")}</strong><span>Max ${num(row.portfolioAllocation?.suggestedMaxWeightPct)}%</span></div>
+        </div>
+        <div class="metric narrative">
+          <span>${t("walkForward")}</span>
+          <p>${row.backtest?.available ? `Trades ${escapeHtml(row.backtest.trades)} · Win ${pct(row.backtest.winRate)} · Avg 20D ${pct(row.backtest.averageReturn20d, true)} · Max DD ${pct(row.backtest.maxDrawdown)}` : escapeHtml(row.backtest?.reason || "Not enough data")}</p>
+        </div>
+        <div class="metric narrative">
+          <span>${t("adaptivePolicy")}</span>
+          <p>${escapeHtml(row.adaptiveEnsemble?.policy || "Maintain current model weights")} · Sim prob ${pct(row.adaptiveEnsemble?.probability)} · Stability ${num(row.adaptiveEnsemble?.stability, 2)}</p>
+        </div>
+        <div class="metric narrative">
+          <span>${t("learningLoop")}</span>
+          <p>Evaluated now: ${escapeHtml(row.learningState?.evaluatedNow ?? 0)} · Avg error: ${row.learningState?.lastAverageError == null ? "Waiting for 7-day results" : pct(row.learningState.lastAverageError)}</p>
+        </div>
+      </section>
 
-      <div class="metric narrative">
-        <span>${t("institutionalLayer")}</span>
-        <p>Quality ${num(row.institutionalChecks?.qualityScore)} · Passed ${escapeHtml(row.institutionalChecks?.passedChecks ?? 0)} checks · ${escapeHtml((row.institutionalChecks?.riskFlags || []).join(", ") || "No major proxy flags")}</p>
-      </div>
+      <section class="tab-panel" data-card="${cardId}" data-panel="risk">
+        <div class="metric narrative">
+          <span>${t("riskWarning")}</span>
+          <p>${escapeHtml(row.mainRiskWarning || fallbackRiskWarning(row, row.smallCapRiskLevel))}</p>
+        </div>
+        <div class="metric narrative">
+          <span>${t("riskManagement")}</span>
+          <p>Stop: ${escapeHtml(row.riskManagement?.stopLossArea || "Not enough data")} · Target: ${escapeHtml(row.riskManagement?.takeProfitZone || "Not enough data")} · Size: ${escapeHtml(row.riskManagement?.positionSize || "Not enough data")}</p>
+        </div>
+      </section>
 
-      <div class="score-grid">
-        <div class="metric"><span>${t("marketRegime")}</span><strong>${escapeHtml(row.marketRegime?.label || "Not enough data")}</strong><span>Risk-on ${num(row.marketRegime?.riskOnScore)}</span></div>
-        <div class="metric"><span>${t("newsImpact")}</span><strong>${escapeHtml(row.newsImpact?.label || "Not enough data")}</strong><span>Fresh ${num(row.newsImpact?.freshnessScore)} · trusted ${escapeHtml(row.newsImpact?.trustedRecentCount ?? 0)}</span></div>
-        <div class="metric"><span>Priced-in</span><strong>${escapeHtml(row.pricedIn?.label || "Not enough data")}</strong><span>Penalty ${num(row.pricedIn?.penalty)}</span></div>
-        <div class="metric"><span>${t("portfolioAllocation")}</span><strong>${escapeHtml(row.portfolioAllocation?.bucket || "Very Small")}</strong><span>Max ${num(row.portfolioAllocation?.suggestedMaxWeightPct)}%</span></div>
-      </div>
-
-      <div class="metric narrative">
-        <span>${t("walkForward")}</span>
-        <p>${row.backtest?.available ? `Trades ${escapeHtml(row.backtest.trades)} · Win ${pct(row.backtest.winRate)} · Avg 20D ${pct(row.backtest.averageReturn20d, true)} · Max DD ${pct(row.backtest.maxDrawdown)}` : escapeHtml(row.backtest?.reason || "Not enough data")}</p>
-      </div>
-
-      <div class="metric narrative">
-        <span>${t("riskWarning")}</span>
-        <p>${escapeHtml(row.mainRiskWarning || fallbackRiskWarning(row, row.smallCapRiskLevel))}</p>
-      </div>
-
-      <div class="metric narrative">
-        <span>${t("riskManagement")}</span>
-        <p>Stop: ${escapeHtml(row.riskManagement?.stopLossArea || "Not enough data")} · Target: ${escapeHtml(row.riskManagement?.takeProfitZone || "Not enough data")} · Size: ${escapeHtml(row.riskManagement?.positionSize || "Not enough data")}</p>
-      </div>
-
-      <ul class="headlines">
-        ${row.headlines.slice(0, 5).map((item) => `
-          <li>
-            ${item.url ? `<a href="${escapeHtml(item.url)}" target="_blank" rel="noreferrer">${escapeHtml(item.title)}</a>` : `<span>${escapeHtml(item.title)}</span>`}
-            ${item.summary ? `<p class="headline-summary">${escapeHtml(item.summary)}</p>` : ""}
-            <div class="source">${escapeHtml(item.source)}</div>
-          </li>
-        `).join("")}
-      </ul>
+      <section class="tab-panel" data-card="${cardId}" data-panel="news">
+        <ul class="headlines">
+          ${row.headlines.slice(0, 5).map((item) => `
+            <li>
+              ${item.url ? `<a href="${escapeHtml(item.url)}" target="_blank" rel="noreferrer">${escapeHtml(item.title)}</a>` : `<span>${escapeHtml(item.title)}</span>`}
+              ${item.summary ? `<p class="headline-summary">${escapeHtml(item.summary)}</p>` : ""}
+              <div class="source">${escapeHtml(item.source)}</div>
+            </li>
+          `).join("")}
+        </ul>
+      </section>
     </article>
   `;
 }
@@ -580,6 +614,19 @@ document.querySelectorAll(".lang").forEach((button) => {
 });
 
 analyzeButton.addEventListener("click", analyze);
+
+resultsEl.addEventListener("click", (event) => {
+  const button = event.target.closest(".tab-button");
+  if (!button) return;
+  const { card, tab } = button.dataset;
+  resultsEl.querySelectorAll(`.tab-button[data-card="${card}"]`).forEach((item) => {
+    item.classList.toggle("active", item === button);
+  });
+  resultsEl.querySelectorAll(`.tab-panel[data-card="${card}"]`).forEach((panel) => {
+    panel.classList.toggle("active", panel.dataset.panel === tab);
+  });
+});
+
 applyLanguage();
 
 if ("serviceWorker" in navigator) {
