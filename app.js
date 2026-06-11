@@ -16,6 +16,7 @@ const translations = {
     risk: "Risk",
     finalScore: "Final Score",
     rankingScore: "Ranking Score",
+    scanBestScore: "Scan Best Score",
     setup: "Rising Setup",
     upsideProb: "Upside Probability",
     entryStyle: "Entry Style",
@@ -75,6 +76,7 @@ const translations = {
     risk: "리스크",
     finalScore: "최종 점수",
     rankingScore: "랭킹 점수",
+    scanBestScore: "스캔 추천 점수",
     setup: "상승 셋업",
     upsideProb: "상승 확률",
     entryStyle: "진입 스타일",
@@ -480,6 +482,7 @@ function hydrateResult(row) {
   return {
     ...row,
     rankingScore: isFiniteNumber(row.rankingScore) ? row.rankingScore : fallbackRankingScore(row, setup),
+    scanBestScore: isFiniteNumber(row.scanBestScore) ? row.scanBestScore : null,
     risingSetupLabel: setup,
     estimatedUpsideProbability,
     smallCapCatalystScore: smallCapScore,
@@ -559,6 +562,9 @@ function renderResult(rawRow) {
   const showBestBadge = latestData?.mode === "scan" && row.rank === 1;
   const bestBadge = showBestBadge ? `<span class="best-badge">${t("bestCandidate")}</span>` : "";
   const cardId = `card-${escapeHtml(row.ticker)}-${escapeHtml(row.rank ?? 0)}`;
+  const scanScoreMetric = latestData?.mode === "scan" && isFiniteNumber(row.scanBestScore)
+    ? `<div class="metric"><span>${t("scanBestScore")}</span><strong>${num(row.scanBestScore)}</strong></div>`
+    : "";
   return `
     <article class="stock-card">
       <div class="stock-head">
@@ -573,6 +579,7 @@ function renderResult(rawRow) {
       <div class="score-grid">
         <div class="metric"><span>${t("finalScore")}</span><strong class="${actionClass}">${num(row.finalScore)}</strong></div>
         <div class="metric"><span>${t("rankingScore")}</span><strong>${num(row.rankingScore)}</strong></div>
+        ${scanScoreMetric}
         <div class="metric"><span>${t("confidence")}</span><strong>${num(row.confidence)}%</strong></div>
         <div class="metric"><span>${t("upsideProb")}</span><strong>${pct(row.estimatedUpsideProbability)}</strong></div>
       </div>
