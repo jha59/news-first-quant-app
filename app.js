@@ -139,19 +139,34 @@ function apiUrl(path) {
 }
 
 function money(value) {
-  if (value === null || value === undefined) return "N/A";
+  if (!isFiniteNumber(value)) return "Not enough data";
   return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(value);
 }
 
 function pct(value, signed = false) {
-  if (value === null || value === undefined) return "N/A";
+  if (!isFiniteNumber(value)) return "Not enough data";
   const body = `${(value * 100).toFixed(1)}%`;
   return signed && value > 0 ? `+${body}` : body;
 }
 
 function num(value, digits = 1) {
-  if (value === null || value === undefined) return "N/A";
+  if (!isFiniteNumber(value)) return "Not enough data";
   return Number(value).toFixed(digits);
+}
+
+function isFiniteNumber(value) {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function safeNumber(...values) {
+  for (const value of values) {
+    if (isFiniteNumber(value)) return value;
+  }
+  return 0;
+}
+
+function hasRealText(value) {
+  return typeof value === "string" && value.trim() && value.trim() !== "N/A";
 }
 
 function escapeHtml(value) {
@@ -166,6 +181,126 @@ function scoreClass(value) {
   if (value >= 55) return "";
   if (value >= 30) return "warn";
   return "bad";
+}
+
+function fallbackSetup(row) {
+  const trend = row.technical?.trendLabel || "unknown";
+  const rsi = safeNumber(row.technical?.rsi, 50);
+  const newsScore = safeNumber(row.newsScore);
+  const negCount = Object.values(row.negativeHits || {}).reduce((sum, value) => sum + safeNumber(value), 0);
+  const mcUp = safeNumber(row.monteCarlo?.probabilityUp20d, row.prediction?.probabilityUp1w, 0.5);
+  const volumeRatio = safeNumber(row.technical?.volumeRatio, 1);
+  if (trend === "downtrend" || negCount >= 4 || mcUp < 0.42) return "Bearish / Avoid";
+  if (rsi > 74 || safeNumber(row.technical?.return1w) > 0.18) return "Overextended / Wait";
+  if (trend === "uptrend" && volumeRatio >= 1.35 && rsi <= 72 && mcUp >= 0.55) return "Momentum Breakout Setup";
+  if (trend === "uptrend" && rsi >= 45 && rsi <= 70 && newsScore > 5 && mcUp >= 0.52) return "Early Bullish Setup";
+  return "Neutral / Wait";
+}
+
+function fallbackEntryStyle(setup) {
+  if (setup === "Momentum Breakout Setup") return "Breakout candidate";
+  if (setup === "Healthy Pullback Buy Setup") return "Healthy pullback setup";
+  if (setup === "Early Bullish Setup") return "Wait for pullback";
+  if (setup === "Overextended / Wait") return "Avoid chasing";
+  if (setup === "Bearish / Avoid") return "Avoid";
+  return "Wait for better entry";
+}
+
+function fallbackRankingScore(row, setup) {
+  const finalScore = safeNumber(row.finalScore);
+  const confidence = safeNumber(row.confidence);
+  const mcUp = safeNumber(row.monteCarlo?.probabilityUp20d, row.prediction?.probabilityUp1w, 0.5);
+  const negCount = Object.values(row.negativeHits || {}).reduce((sum, value) => sum + safeNumber(value), 0);
+  const setupBonus = {
+    "Healthy Pullback Buy Setup": 14,
+    "Momentum Breakout Setup": 12,
+    "Early Bullish Setup": 8,
+    "Overextended / Wait": -12,
+    "Bearish / Avoid": -25,
+  }[setup] || 0;
+  return finalScore + confidence * 0.3 + setupBonus + (mcUp - 0.5) * 40 - negCount * 5;
+}
+
+function fallbackSmallCapRisk(row) {
+  const volatility = safeNumber(row.technical?.volatility);
+  const negCount = Object.values(row.negativeHits || {}).reduce((sum, value) => sum + safeNumber(value), 0);
+  if (negCount >= 5 || volatility > 0.95) return "Extreme";
+  if (negCount >= 2 || volatility > 0.7) return "High";
+  if (volatility > 0.45 || safeNumber(row.smallCapCatalystScore) > 35) return "Medium";
+  return "Low";
+}
+
+function fallbackReason(row, setup) {
+  const reasons = [];
+  if (safeNumber(row.newsScore) > 15) reasons.push("recent catalyst news");
+  if (row.technical?.trendLabel === "uptrend") reasons.push("an uptrend");
+  if (safeNumber(row.technical?.rsi, 50) >= 45 && safeNumber(row.technical?.rsi, 50) <= 70) reasons.push("constructive RSI");
+  if (safeNumber(row.sectorMacroScore) > 0) reasons.push("sector macro support");
+  if (safeNumber(row.monteCarlo?.probabilityUp20d, 0.5) >= 0.55) reasons.push("Monte Carlo upside probability above 55%");
+  const reasonText = reasons.length ? reasons.join(", ") : "mixed signals that require confirmation";
+  return `${row.ticker} ranks here because ${reasonText}. Current setup: ${setup}. This is a probability-based candidate, not financial advice.`;
+}
+
+function fallbackRiskWarning(row, smallCapRisk) {
+  const negCount = Object.values(row.negativeHits || {}).reduce((sum, value) => sum + safeNumber(value), 0);
+  if (negCount >= 3) return "Negative headline risk is elevated; wait for confirmation.";
+  if (row.technical?.trendLabel === "downtrend") return "Trend is down, so positive news needs price confirmation.";
+  if (smallCapRisk === "High" || smallCapRisk === "Extreme") return "Catalyst and volatility risk are high; use smaller sizing.";
+  if (safeNumber(row.technical?.volatility) > 0.7) return "Volatility is elevated; risk controls matter more than usual.";
+  return "No single dominant risk, but news and market conditions can change quickly.";
+}
+
+function fallbackRiskManagement(row) {
+  const price = safeNumber(row.technical?.price);
+  const support = safeNumber(row.technical?.support);
+  const resistance = safeNumber(row.technical?.resistance);
+  const volatility = safeNumber(row.technical?.volatility);
+  const stop = support > 0 ? support * 0.98 : price * (volatility > 0.65 ? 0.88 : 0.92);
+  const targetLow = resistance > price ? resistance : price * 1.08;
+  const targetHigh = price * (volatility > 0.65 ? 1.25 : 1.18);
+  const size = volatility > 0.85 ? "Very Small" : volatility > 0.55 ? "Small" : "Normal";
+  return {
+    stopLossArea: money(stop),
+    takeProfitZone: `${money(targetLow)} - ${money(targetHigh)}`,
+    positionSize: size,
+  };
+}
+
+function hydrateResult(row) {
+  const setup = hasRealText(row.risingSetupLabel) ? row.risingSetupLabel : fallbackSetup(row);
+  const estimatedUpsideProbability = safeNumber(
+    row.estimatedUpsideProbability,
+    row.prediction?.probabilityUp1w,
+    row.prediction?.probabilityUp1d,
+    row.monteCarlo?.probabilityUp20d,
+    0.5
+  );
+  const smallCapScore = safeNumber(row.smallCapCatalystScore);
+  const smallCapRisk = hasRealText(row.smallCapRiskLevel) ? row.smallCapRiskLevel : fallbackSmallCapRisk({ ...row, smallCapCatalystScore: smallCapScore });
+  const fallbackRisk = fallbackRiskManagement(row);
+  const riskManagement = row.riskManagement && Object.keys(row.riskManagement).length
+    ? {
+        stopLossArea: hasRealText(row.riskManagement.stopLossArea) ? row.riskManagement.stopLossArea : fallbackRisk.stopLossArea,
+        takeProfitZone: hasRealText(row.riskManagement.takeProfitZone) ? row.riskManagement.takeProfitZone : fallbackRisk.takeProfitZone,
+        positionSize: hasRealText(row.riskManagement.positionSize) ? row.riskManagement.positionSize : fallbackRisk.positionSize,
+      }
+    : fallbackRisk;
+  return {
+    ...row,
+    rankingScore: isFiniteNumber(row.rankingScore) ? row.rankingScore : fallbackRankingScore(row, setup),
+    risingSetupLabel: setup,
+    estimatedUpsideProbability,
+    smallCapCatalystScore: smallCapScore,
+    smallCapRiskLevel: smallCapRisk,
+    recommendationReason: hasRealText(row.recommendationReason) ? row.recommendationReason : fallbackReason(row, setup),
+    mainRiskWarning: hasRealText(row.mainRiskWarning) ? row.mainRiskWarning : fallbackRiskWarning(row, smallCapRisk),
+    suggestedEntryStyle: hasRealText(row.suggestedEntryStyle) ? row.suggestedEntryStyle : fallbackEntryStyle(setup),
+    riskManagement,
+    technical: {
+      ...row.technical,
+      volumeRatio: isFiniteNumber(row.technical?.volumeRatio) ? row.technical.volumeRatio : 1,
+    },
+  };
 }
 
 function setLoading(isLoading) {
@@ -218,7 +353,8 @@ function renderMacro(data) {
   `;
 }
 
-function renderResult(row) {
+function renderResult(rawRow) {
+  const row = hydrateResult(rawRow);
   const actionClass = scoreClass(row.finalScore);
   return `
     <article class="stock-card">
@@ -245,7 +381,7 @@ function renderResult(row) {
 
       <div class="score-grid">
         <div class="metric"><span>${t("setup")}</span><strong>${escapeHtml(trPhrase(row.risingSetupLabel))}</strong></div>
-        <div class="metric"><span>${t("entryStyle")}</span><strong>${escapeHtml(row.suggestedEntryStyle || "N/A")}</strong></div>
+        <div class="metric"><span>${t("entryStyle")}</span><strong>${escapeHtml(row.suggestedEntryStyle || "Wait for better entry")}</strong></div>
         <div class="metric"><span>${t("trend")}</span><strong>${escapeHtml(trPhrase(row.technical.trendLabel))}</strong></div>
         <div class="metric"><span>RSI</span><strong>${num(row.technical.rsi)}</strong></div>
       </div>
@@ -254,7 +390,7 @@ function renderResult(row) {
         <div class="metric"><span>${t("price")}</span><strong>${money(row.technical.price)}</strong></div>
         <div class="metric"><span>${t("newsScore")}</span><strong>${num(row.newsScore)}</strong></div>
         <div class="metric"><span>${t("smallCap")}</span><strong>${num(row.smallCapCatalystScore)}</strong></div>
-        <div class="metric"><span>${t("smallCapRisk")}</span><strong>${escapeHtml(row.smallCapRiskLevel || "N/A")}</strong></div>
+        <div class="metric"><span>${t("smallCapRisk")}</span><strong>${escapeHtml(row.smallCapRiskLevel || "Low")}</strong></div>
       </div>
 
       <div class="meta">
@@ -267,17 +403,17 @@ function renderResult(row) {
 
       <div class="metric narrative">
         <span>${t("whyThis")}</span>
-        <p>${escapeHtml(row.recommendationReason || "N/A")}</p>
+        <p>${escapeHtml(row.recommendationReason || fallbackReason(row, row.risingSetupLabel))}</p>
       </div>
 
       <div class="metric narrative">
         <span>${t("riskWarning")}</span>
-        <p>${escapeHtml(row.mainRiskWarning || "N/A")}</p>
+        <p>${escapeHtml(row.mainRiskWarning || fallbackRiskWarning(row, row.smallCapRiskLevel))}</p>
       </div>
 
       <div class="metric narrative">
         <span>${t("riskManagement")}</span>
-        <p>Stop: ${escapeHtml(row.riskManagement?.stopLossArea || "N/A")} · Target: ${escapeHtml(row.riskManagement?.takeProfitZone || "N/A")} · Size: ${escapeHtml(row.riskManagement?.positionSize || "N/A")}</p>
+        <p>Stop: ${escapeHtml(row.riskManagement?.stopLossArea || "Not enough data")} · Target: ${escapeHtml(row.riskManagement?.takeProfitZone || "Not enough data")} · Size: ${escapeHtml(row.riskManagement?.positionSize || "Not enough data")}</p>
       </div>
 
       <ul class="headlines">
