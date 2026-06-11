@@ -226,6 +226,14 @@ class TechnicalSnapshot:
     support: Optional[float] = None
     resistance: Optional[float] = None
     volatility: Optional[float] = None
+    volume_ratio: Optional[float] = None
+    return_5d: Optional[float] = None
+    return_1w: Optional[float] = None
+    return_1m: Optional[float] = None
+    above_ma20: Optional[float] = None
+    above_ma50: Optional[float] = None
+    above_ma200: Optional[float] = None
+    macd_above_signal: Optional[bool] = None
     score: float = 0.0
     notes: List[str] = field(default_factory=list)
 
@@ -279,6 +287,17 @@ class StockResult:
     monte_carlo: MonteCarloSnapshot
     fundamentals: FundamentalsSnapshot
     prediction: PredictionSnapshot
+    ranking_score: float = 0.0
+    rising_setup_label: str = "N/A"
+    estimated_upside_probability: Optional[float] = None
+    small_cap_catalyst_score: float = 0.0
+    small_cap_risk_level: str = "N/A"
+    small_cap_summary: str = "N/A"
+    recommendation_reason: str = "N/A"
+    main_risk_warning: str = "N/A"
+    suggested_entry_style: str = "N/A"
+    risk_management: Dict[str, str] = field(default_factory=dict)
+    backtest: Dict[str, object] = field(default_factory=dict)
     positive_hits: Dict[str, int] = field(default_factory=dict)
     negative_hits: Dict[str, int] = field(default_factory=dict)
     headlines: List[NewsItem] = field(default_factory=list)
@@ -623,16 +642,45 @@ def sector_macro_adjustment(sector: str, macro_pos: Dict[str, int], macro_risk: 
     return float(score)
 
 
+def news_recency_weight(item: NewsItem) -> float:
+    published = parse_news_datetime(item.published)
+    if published is None:
+        return 0.70
+    age_hours = (datetime.now(timezone.utc) - published).total_seconds() / 3600.0
+    if age_hours <= 6:
+        return 1.40
+    if age_hours <= 24:
+        return 1.25
+    if age_hours <= 72:
+        return 1.00
+    if age_hours <= 168:
+        return 0.70
+    return 0.40
+
+
 def score_news(items: Sequence[NewsItem]) -> Tuple[float, Dict[str, int], Dict[str, int], List[str]]:
     if not items:
         return -25.0, {}, {}, ["No fresh news found; confidence reduced."]
 
     weighted_text_parts = []
     credibility_bonus = 0.0
+    recency_bonus = 0.0
+    source_names = set()
+    dated_items = 0
+    fresh_items = 0
     for item in items:
-        weight = credibility_weight(item.source)
-        weighted_text_parts.append((item.title + " ") * max(1, int(round(weight * 2))))
-        credibility_bonus += min(weight - 0.85, 0.35)
+        source_weight = credibility_weight(item.source)
+        recency_weight = news_recency_weight(item)
+        total_weight = source_weight * recency_weight
+        weighted_text_parts.append((item.title + " ") * max(1, int(round(total_weight * 2.4))))
+        credibility_bonus += min(source_weight - 0.85, 0.35) * recency_weight
+        recency_bonus += max(recency_weight - 0.80, -0.35)
+        source_names.add(item.source.lower().strip() or "unknown")
+        published = parse_news_datetime(item.published)
+        if published is not None:
+            dated_items += 1
+            if (datetime.now(timezone.utc) - published) <= timedelta(hours=48):
+                fresh_items += 1
 
     text = clean_text(" ".join(weighted_text_parts)).lower()
     positive_hits = count_event_hits(text, POSITIVE_EVENTS)
@@ -644,14 +692,30 @@ def score_news(items: Sequence[NewsItem]) -> Tuple[float, Dict[str, int], Dict[s
     negative_points = sum(negative_hits.values()) * 14.0
     sentiment_points = (0.60 * model_score + 0.40 * keyword_score) * 38.0
     breadth_bonus = min(len(items), 30) * 0.7
+    diversity_bonus = min(len(source_names), 8) * 1.15
     credibility_bonus = min(credibility_bonus, 11.0)
-    score = positive_points - negative_points + sentiment_points + breadth_bonus + credibility_bonus
+    recency_bonus = clamp(recency_bonus, -8.0, 10.0)
+    score = (
+        positive_points
+        - negative_points
+        + sentiment_points
+        + breadth_bonus
+        + credibility_bonus
+        + diversity_bonus
+        + recency_bonus
+    )
 
     notes = []
     if negative_points > positive_points:
         notes.append("Negative headlines dominate positive catalysts.")
     if len(items) < 6:
         notes.append("News sample is thin.")
+    if dated_items and fresh_items < max(2, dated_items // 4):
+        score -= 7.0
+        notes.append("Few headlines are fresh within the last 48 hours.")
+    if len(source_names) < 3:
+        score -= 4.0
+        notes.append("News source diversity is limited.")
     return float(score), positive_hits, negative_hits, notes
 
 
@@ -730,6 +794,14 @@ def technical_analysis(history) -> TechnicalSnapshot:
     volume_ratio = safe_float(volume.iloc[-1] / volume.rolling(20).mean().iloc[-1], 1.0)
     ret_5d = safe_float(close.iloc[-1] / close.iloc[-6] - 1, 0.0) if len(close) > 6 else 0.0
     ret_1m = safe_float(close.iloc[-1] / close.iloc[-22] - 1, 0.0) if len(close) > 22 else 0.0
+    snap.volume_ratio = volume_ratio
+    snap.return_5d = ret_5d
+    snap.return_1w = ret_5d
+    snap.return_1m = ret_1m
+    snap.above_ma20 = safe_float(above_ma20, 0.0)
+    snap.above_ma50 = safe_float(above_ma50, 0.0)
+    snap.above_ma200 = safe_float(above_ma200, 0.0)
+    snap.macd_above_signal = safe_float(macd.iloc[-1], 0.0) > safe_float(signal.iloc[-1], 0.0)
 
     score = 0.0
     if slope60 > 0.0007 and slope120 > 0.0003:
@@ -762,7 +834,7 @@ def technical_analysis(history) -> TechnicalSnapshot:
     elif rsi < 34 and snap.trend_label != "downtrend":
         score += 5
 
-    if safe_float(macd.iloc[-1], 0.0) > safe_float(signal.iloc[-1], 0.0):
+    if snap.macd_above_signal:
         score += 8
     else:
         score -= 4
@@ -875,6 +947,24 @@ def probability_from_signal(signal: float) -> float:
     return float(1.0 / (1.0 + math.exp(-signal)))
 
 
+def signal_alignment_boost(signals: Sequence[float]) -> Tuple[float, float]:
+    strong_positive = sum(1 for value in signals if value > 0.18)
+    strong_negative = sum(1 for value in signals if value < -0.18)
+    weak_or_neutral = len(signals) - strong_positive - strong_negative
+
+    if strong_positive >= 4 and strong_negative == 0:
+        return 0.18, 1.12
+    if strong_positive >= 3 and strong_negative <= 1:
+        return 0.10, 1.06
+    if strong_negative >= 3 and strong_positive <= 1:
+        return -0.14, 1.08
+    if strong_positive >= 2 and strong_negative >= 2:
+        return 0.0, 0.78
+    if weak_or_neutral >= 3:
+        return 0.0, 0.90
+    return 0.0, 1.0
+
+
 def prediction_analysis(
     history,
     news_score: float,
@@ -906,15 +996,24 @@ def prediction_analysis(
     fund_signal = clamp(fundamentals.score / 50.0, -1.0, 1.0)
     mc_signal = clamp(mc.risk_score / 45.0, -1.0, 1.0)
     neg_penalty = clamp(sum(negative_hits.values()) * 0.18, 0.0, 1.25)
+    alignment_shift, conviction_multiplier = signal_alignment_boost(
+        [news_signal, macro_signal, tech_signal, fund_signal, mc_signal]
+    )
 
     # News gets the strongest directional influence. Fundamentals matter more on the 1y horizon.
     signal_1d = 0.58 * news_signal + 0.20 * tech_signal + 0.12 * macro_signal + 0.10 * mc_signal - neg_penalty
     signal_1w = 0.55 * news_signal + 0.23 * tech_signal + 0.12 * macro_signal + 0.07 * mc_signal + 0.03 * fund_signal - neg_penalty
     signal_1y = 0.38 * news_signal + 0.18 * tech_signal + 0.14 * macro_signal + 0.30 * fund_signal - neg_penalty * 0.75
+    signal_1d = signal_1d * conviction_multiplier + alignment_shift
+    signal_1w = signal_1w * conviction_multiplier + alignment_shift
+    signal_1y = signal_1y * conviction_multiplier + alignment_shift * 0.75
 
     prob_1d = probability_from_signal(signal_1d)
     prob_1w = probability_from_signal(signal_1w)
     prob_1y = probability_from_signal(signal_1y)
+    prob_1d = clamp(prob_1d, 0.35, 0.75)
+    prob_1w = clamp(prob_1w, 0.35, 0.75)
+    prob_1y = clamp(prob_1y, 0.35, 0.75)
 
     base_1d = daily_mu
     base_1w = daily_mu * 5.0
@@ -938,26 +1037,500 @@ def prediction_analysis(
     pred.expected_return_1d = ret_1d
     pred.expected_return_1w = ret_1w
     pred.expected_return_1y = ret_1y
-    pred.method = "news-weighted hybrid forecast using recent returns, volatility, trend, fundamentals, macro, and Monte Carlo"
+    pred.method = (
+        "recency-weighted ensemble forecast using news catalysts, source quality, "
+        "technical trend, fundamentals, macro regime, Monte Carlo risk, and signal alignment"
+    )
     return pred
 
 
-def action_from_score(final_score: float, negative_hits: Dict[str, int], technical: TechnicalSnapshot) -> str:
+def bullish_bearish_signal_counts(
+    news_score: float,
+    positive_hits: Dict[str, int],
+    negative_hits: Dict[str, int],
+    technical: TechnicalSnapshot,
+    fundamentals: FundamentalsSnapshot,
+    mc: MonteCarloSnapshot,
+    sector_macro_score: float,
+    macro_risk_score: float,
+) -> Tuple[int, int, List[str], List[str]]:
+    """Count independent bullish/bearish signals so one headline cannot dominate ranking."""
+    bullish: List[str] = []
+    bearish: List[str] = []
     neg_count = sum(negative_hits.values())
-    if final_score >= 78 and neg_count <= 1 and technical.trend_label != "downtrend":
-        return "STRONG WATCH / BUY-CANDIDATE"
-    if final_score >= 55 and neg_count <= 3:
-        return "WATCHLIST"
-    if final_score >= 30:
-        return "NEUTRAL / WAIT"
+
+    if news_score > 28 or sum(positive_hits.values()) >= 2:
+        bullish.append("positive catalyst news")
+    if technical.trend_label == "uptrend":
+        bullish.append("uptrend")
+    if (technical.above_ma50 or 0.0) > -0.01 or (technical.above_ma200 or 0.0) > 0:
+        bullish.append("price above key moving average")
+    if technical.rsi is not None and 45 <= technical.rsi <= 70:
+        bullish.append("RSI in constructive range")
+    if (technical.volume_ratio or 0.0) >= 1.15:
+        bullish.append("above-average volume")
+    if (mc.probability_up_20d or 0.0) >= 0.55:
+        bullish.append("Monte Carlo chance up above 55%")
+    if fundamentals.score > 5:
+        bullish.append("positive fundamentals")
+    if sector_macro_score > 0:
+        bullish.append("sector macro tailwind")
+    if neg_count <= 1:
+        bullish.append("low negative headline count")
+
+    if technical.trend_label == "downtrend":
+        bearish.append("downtrend")
+    if neg_count >= 2:
+        bearish.append("negative catalyst news")
+    if any(key in negative_hits for key in ("biotech_failure", "legal_regulatory", "analyst_downgrade")):
+        bearish.append("regulatory/legal/downgrade risk")
+    if technical.rsi is not None and technical.rsi >= 76:
+        bearish.append("extremely overbought RSI")
+    if (technical.return_1w or 0.0) >= 0.18 or (technical.return_1m or 0.0) >= 0.40:
+        bearish.append("large recent spike already happened")
+    if (mc.probability_up_20d or 0.50) < 0.45:
+        bearish.append("Monte Carlo chance up below 45%")
+    if fundamentals.score < -5:
+        bearish.append("weak fundamentals")
+    if macro_risk_score >= 25:
+        bearish.append("high macro risk")
+
+    return len(bullish), len(bearish), bullish, bearish
+
+
+def volume_activity_score(technical: TechnicalSnapshot) -> float:
+    """Score unusual but not reckless volume expansion."""
+    ratio = technical.volume_ratio
+    if ratio is None:
+        return 0.0
+    if 1.2 <= ratio <= 3.5:
+        return min(10.0, 4.0 + (ratio - 1.2) * 2.6)
+    if 3.5 < ratio <= 6.0:
+        return 4.0
+    if ratio > 6.0:
+        return -4.0
+    return max(0.0, (ratio - 0.8) * 5.0)
+
+
+def trend_quality_score(technical: TechnicalSnapshot) -> float:
+    """Separate trend quality from the broader technical score."""
+    score = 0.0
+    if technical.trend_label == "uptrend":
+        score += 9.0
+    elif technical.trend_label == "sideways / base":
+        score += 4.0
+    elif technical.trend_label == "downtrend":
+        score -= 10.0
+    if (technical.above_ma50 or 0.0) > 0:
+        score += 3.0
+    if (technical.above_ma200 or 0.0) > 0:
+        score += 3.0
+    if technical.pullback_label == "healthy pullback near moving average":
+        score += 2.0
+    if technical.pullback_label == "extended / chased":
+        score -= 5.0
+    return clamp(score, -15.0, 15.0)
+
+
+def risk_keyword_count(positive_hits: Dict[str, int], negative_hits: Dict[str, int], news: Sequence[NewsItem]) -> int:
+    """Detect severe small-cap/biotech style risk phrases beyond the regular dictionaries."""
+    text = clean_text(" ".join(item.title for item in news)).lower()
+    extra_risks = [
+        "dilution", "offering", "share offering", "bankruptcy", "going concern",
+        "reverse split", "short report", "clinical hold", "failed trial", "fda rejection",
+    ]
+    return sum(negative_hits.values()) + sum(1 for phrase in extra_risks if phrase in text)
+
+
+def compute_probability_ranking_score(
+    news_score: float,
+    positive_hits: Dict[str, int],
+    negative_hits: Dict[str, int],
+    technical: TechnicalSnapshot,
+    fundamentals: FundamentalsSnapshot,
+    mc: MonteCarloSnapshot,
+    macro_score: float,
+    macro_risk_score: float,
+    sector_macro_score: float,
+) -> Tuple[float, float, List[str], List[str]]:
+    """Blend independent signals into a probability-based ranking score."""
+    bullish_count, bearish_count, bullish_reasons, bearish_reasons = bullish_bearish_signal_counts(
+        news_score,
+        positive_hits,
+        negative_hits,
+        technical,
+        fundamentals,
+        mc,
+        sector_macro_score,
+        macro_risk_score,
+    )
+    news_component = clamp((news_score + 30.0) / 140.0, 0.0, 1.0) * 35.0
+    technical_component = clamp((technical.score + 35.0) / 120.0, 0.0, 1.0) * 18.0
+    trend_component = max(0.0, trend_quality_score(technical)) / 15.0 * 15.0
+    volume_component = max(0.0, volume_activity_score(technical))
+    fundamentals_component = clamp((fundamentals.score + 10.0) / 60.0, 0.0, 1.0) * 10.0
+    mc_prob = mc.probability_up_20d if mc.probability_up_20d is not None else 0.50
+    mc_component = clamp((mc_prob - 0.35) / 0.40, 0.0, 1.0) * 10.0
+    macro_component = clamp((macro_score * 0.35 + sector_macro_score + 15.0) / 45.0, 0.0, 1.0) * 10.0
+
+    risk_penalty = 0.0
+    risk_penalty += sum(negative_hits.values()) * 6.5
+    risk_penalty += max(0.0, macro_risk_score - 15.0) * 0.45
+    if technical.pullback_label == "extended / chased":
+        risk_penalty += 12.0
+    if technical.trend_label == "downtrend":
+        risk_penalty += 14.0
+    if (technical.return_1w or 0.0) > 0.20:
+        risk_penalty += 8.0
+    if (technical.volatility or 0.0) > 0.75:
+        risk_penalty += 6.0
+
+    alignment_boost = 0.0
+    if bullish_count >= 6 and bearish_count <= 1:
+        alignment_boost = 24.0
+    elif bullish_count >= 5 and bearish_count <= 2:
+        alignment_boost = 17.0
+    elif bullish_count >= 4 and bearish_count <= 2:
+        alignment_boost = 9.0
+    if bearish_count >= 3:
+        risk_penalty += 22.0 + (bearish_count - 3) * 5.0
+
+    final_score = (
+        news_component
+        + technical_component
+        + trend_component
+        + volume_component
+        + fundamentals_component
+        + mc_component
+        + macro_component
+        + alignment_boost
+        - risk_penalty
+    )
+    return clamp(final_score, 0.0, 100.0), risk_penalty, bullish_reasons, bearish_reasons
+
+
+def detect_rising_stock_setup(
+    technical: TechnicalSnapshot,
+    news_score: float,
+    negative_hits: Dict[str, int],
+    mc: MonteCarloSnapshot,
+    sector_macro_score: float,
+) -> str:
+    """Classify the current setup without promising an outcome."""
+    try:
+        neg_count = sum(negative_hits.values())
+        rsi = technical.rsi or 50.0
+        volume_ratio = technical.volume_ratio or 1.0
+        mc_up = mc.probability_up_20d or 0.50
+        near_ma = -0.06 <= (technical.above_ma20 or 0.0) <= 0.04 or -0.07 <= (technical.above_ma50 or 0.0) <= 0.04
+
+        if technical.trend_label == "downtrend" or neg_count >= 4 or mc_up < 0.42:
+            return "Bearish / Avoid"
+        if technical.pullback_label == "extended / chased" or rsi > 74 or (technical.return_1w or 0.0) > 0.18:
+            return "Overextended / Wait"
+        if near_ma and volume_ratio >= 1.05 and 45 <= rsi <= 68 and news_score > 15 and neg_count <= 2:
+            return "Healthy Pullback Buy Setup"
+        if technical.trend_label == "uptrend" and volume_ratio >= 1.45 and rsi <= 72 and mc_up >= 0.55:
+            return "Momentum Breakout Setup"
+        if 45 <= rsi <= 70 and (technical.macd_above_signal or volume_ratio >= 1.2) and news_score > 5 and mc_up >= 0.52 and sector_macro_score >= 0:
+            return "Early Bullish Setup"
+    except Exception:
+        return "N/A"
+    return "Neutral / Wait"
+
+
+def small_cap_catalyst_score(
+    info: Dict,
+    sector: str,
+    technical: TechnicalSnapshot,
+    positive_hits: Dict[str, int],
+    negative_hits: Dict[str, int],
+    news: Sequence[NewsItem],
+) -> Tuple[float, str, str]:
+    """Flag high-risk/high-reward catalyst setups, especially small-cap and biotech names."""
+    try:
+        market_cap = safe_float(info.get("marketCap"))
+        text = clean_text(" ".join(item.title for item in news)).lower()
+        catalyst_terms = [
+            "fda approval", "phase 2", "phase ii", "phase 3", "phase iii",
+            "positive trial", "met primary endpoint", "clinical trial", "partnership",
+            "patent", "government contract", "contract award", "selected by",
+        ]
+        severe_risk_terms = [
+            "dilution", "offering", "fda rejection", "failed trial", "clinical hold",
+            "bankruptcy", "short report", "reverse split",
+        ]
+        score = 0.0
+        if market_cap is not None and market_cap < 2_000_000_000:
+            score += 15.0
+        elif market_cap is not None and market_cap < 10_000_000_000:
+            score += 8.0
+        if sector in {"biotech", "space", "space_defense", "defense_ai"}:
+            score += 5.0
+        if (technical.volume_ratio or 0.0) >= 2.0:
+            score += 14.0
+        score += sum(1 for term in catalyst_terms if term in text) * 7.0
+        score += positive_hits.get("biotech_healthcare", 0) * 6.0
+        score += positive_hits.get("contract_partnership", 0) * 4.0
+        if technical.pullback_label != "extended / chased":
+            score += 5.0
+
+        severe_risk_count = sum(1 for term in severe_risk_terms if term in text)
+        risk_points = severe_risk_count * 18.0 + sum(negative_hits.values()) * 5.5
+        score -= min(risk_points * 0.45, 25.0)
+        score = clamp(score, 0.0, 100.0)
+
+        if severe_risk_count >= 2 or sum(negative_hits.values()) >= 5:
+            risk_level = "Extreme"
+        elif severe_risk_count >= 1 or (technical.volatility or 0.0) > 0.95:
+            risk_level = "High"
+        elif (technical.volatility or 0.0) > 0.60 or score >= 45:
+            risk_level = "Medium"
+        else:
+            risk_level = "Low"
+
+        summary = "Small-cap catalyst profile requires smaller position sizing and tighter risk control."
+        if score >= 55:
+            summary = "High-risk/high-reward catalyst setup; position size should be smaller than normal."
+        if risk_level in {"High", "Extreme"}:
+            summary += " Severe catalyst or financing risk is present."
+        return score, risk_level, summary
+    except Exception as exc:
+        return 0.0, "N/A", f"Small-cap catalyst analysis unavailable: {str(exc)[:80]}"
+
+
+def suggested_entry_style(setup_label: str, technical: TechnicalSnapshot) -> str:
+    if setup_label == "Healthy Pullback Buy Setup":
+        return "Healthy pullback setup"
+    if setup_label == "Momentum Breakout Setup":
+        return "Breakout candidate"
+    if setup_label == "Early Bullish Setup":
+        return "Wait for pullback"
+    if setup_label == "Overextended / Wait":
+        return "Avoid chasing"
+    if setup_label == "Bearish / Avoid":
+        return "Avoid"
+    if technical.pullback_label == "extended / chased":
+        return "Avoid chasing"
+    return "Wait for better entry"
+
+
+def compute_ranking_score(
+    final_score: float,
+    confidence: float,
+    setup_label: str,
+    mc: MonteCarloSnapshot,
+    technical: TechnicalSnapshot,
+    negative_hits: Dict[str, int],
+) -> float:
+    setup_bonus = {
+        "Healthy Pullback Buy Setup": 14.0,
+        "Momentum Breakout Setup": 12.0,
+        "Early Bullish Setup": 8.0,
+        "Overextended / Wait": -12.0,
+        "Bearish / Avoid": -25.0,
+    }.get(setup_label, 0.0)
+    mc_bonus = ((mc.probability_up_20d or 0.50) - 0.50) * 40.0
+    volume_bonus = 5.0 if 1.2 <= (technical.volume_ratio or 0.0) <= 3.5 else 0.0
+    risk_penalty = sum(negative_hits.values()) * 5.0
+    if technical.pullback_label == "extended / chased":
+        risk_penalty += 10.0
+    return float(final_score + confidence * 0.30 + setup_bonus + mc_bonus + volume_bonus - risk_penalty)
+
+
+def main_risk_warning_from_components(result: StockResult) -> str:
+    if sum(result.negative_hits.values()) >= 3:
+        return "Negative catalyst count is elevated; wait for risk to clear."
+    if result.technical.pullback_label == "extended / chased":
+        return "Price looks extended; avoid chasing without a new base."
+    if (result.technical.volatility or 0.0) > 0.85:
+        return "Volatility is high; position size should be reduced."
+    if result.small_cap_risk_level in {"High", "Extreme"}:
+        return "Small-cap or clinical catalyst risk is high; use very small sizing."
+    if result.technical.trend_label == "downtrend":
+        return "Trend is down; positive news needs confirmation from price action."
+    return "No single dominant risk, but news and market conditions can change quickly."
+
+
+def generate_recommendation_reason(result: StockResult) -> str:
+    """Create a concise 'why this stock' explanation for ranking transparency."""
+    reasons = []
+    if result.news_score > 25:
+        reasons.append("positive catalyst news")
+    if result.technical.trend_label == "uptrend":
+        reasons.append("strong uptrend")
+    if result.technical.rsi is not None and 45 <= result.technical.rsi <= 70:
+        reasons.append("constructive RSI")
+    if result.sector_macro_score > 0:
+        reasons.append("positive sector macro tailwind")
+    if (result.monte_carlo.probability_up_20d or 0.0) >= 0.55:
+        reasons.append("Monte Carlo upside probability above 55%")
+    if (result.technical.volume_ratio or 0.0) >= 1.2:
+        reasons.append("above-average volume")
+    if not reasons:
+        reasons.append("the setup is mixed and needs confirmation")
+    risk = "medium"
+    if result.small_cap_risk_level in {"High", "Extreme"} or (result.technical.volatility or 0.0) > 0.85:
+        risk = "high"
+    elif sum(result.negative_hits.values()) <= 1 and (result.technical.volatility or 0.0) < 0.45:
+        risk = "lower"
+    return (
+        f"{result.ticker} ranks here because " + ", ".join(reasons[:5])
+        + f". Risk is {risk}; this is a probability-based candidate, not financial advice."
+    )
+
+
+def risk_management_suggestion(result: StockResult) -> Dict[str, str]:
+    """Produce simple educational risk-management levels from support/resistance and volatility."""
+    price = result.technical.price
+    support = result.technical.support
+    resistance = result.technical.resistance
+    volatility = result.technical.volatility or 0.0
+    if price is None:
+        return {"summary": "N/A"}
+    stop = support * 0.98 if support else price * (0.92 if volatility < 0.55 else 0.88)
+    take_profit_low = resistance if resistance and resistance > price else price * 1.08
+    take_profit_high = price * (1.18 if volatility < 0.65 else 1.25)
+    if result.small_cap_risk_level in {"High", "Extreme"} or volatility > 0.90:
+        size = "Very Small"
+    elif volatility > 0.55 or sum(result.negative_hits.values()) >= 2:
+        size = "Small"
+    else:
+        size = "Normal"
+    warnings = []
+    if volatility > 0.65:
+        warnings.append("Volatility elevated")
+    if sum(result.negative_hits.values()) >= 2:
+        warnings.append("Headline risk elevated")
+    if any(key in result.negative_hits for key in ("biotech_failure", "legal_regulatory")):
+        warnings.append("FDA/legal event risk")
+    return {
+        "stopLossArea": f"${stop:,.2f}",
+        "takeProfitZone": f"${take_profit_low:,.2f} - ${take_profit_high:,.2f}",
+        "positionSize": size,
+        "warnings": "; ".join(warnings) if warnings else "Use normal risk controls; no guarantee of outcome.",
+    }
+
+
+def backtest_strategy(ticker: str, history) -> Dict[str, object]:
+    """Educational 20-day forward test using price/volume rules similar to the live setup logic."""
+    if history is None or pd is None or np is None or len(history) < 260:
+        return {"available": False, "reason": "Not enough history for backtest."}
+    try:
+        data = history.copy()
+        close = to_series(data["Close"]).astype(float)
+        volume = to_series(data["Volume"]).astype(float) if "Volume" in data else close * 0
+        ma20 = close.rolling(20).mean()
+        ma50 = close.rolling(50).mean()
+        ma200 = close.rolling(200).mean()
+        delta = close.diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = -delta.clip(upper=0).rolling(14).mean()
+        rsi = 100 - (100 / (1 + gain / loss.replace(0, np.nan)))
+        volume_ratio = volume / volume.rolling(20).mean()
+        momentum_20d = close / close.shift(20) - 1
+
+        entries = (
+            (close > ma50)
+            & (close > ma200)
+            & (rsi.between(45, 70))
+            & (volume_ratio > 1.10)
+            & (momentum_20d > -0.03)
+            & (momentum_20d < 0.22)
+        )
+        forward_return = close.shift(-20) / close - 1
+        trades = forward_return[entries].dropna()
+        if trades.empty:
+            return {"available": False, "reason": "No historical rule-based entries found."}
+        equity = (1 + trades).cumprod()
+        drawdown = equity / equity.cummax() - 1
+        buy_hold = close.iloc[-1] / close.iloc[0] - 1
+        return {
+            "available": True,
+            "ticker": ticker,
+            "trades": int(len(trades)),
+            "winRate": float((trades > 0).mean()),
+            "averageReturn20d": float(trades.mean()),
+            "medianReturn20d": float(trades.median()),
+            "maxDrawdown": float(drawdown.min()),
+            "buyAndHoldReturn": float(buy_hold),
+        }
+    except Exception as exc:
+        return {"available": False, "reason": str(exc)[:120]}
+
+
+def action_from_score(
+    final_score: float,
+    confidence: float,
+    negative_hits: Dict[str, int],
+    technical: TechnicalSnapshot,
+    news_score: float,
+    mc: MonteCarloSnapshot,
+) -> str:
+    neg_count = sum(negative_hits.values())
+    bullish_core = 0
+    if news_score > 25:
+        bullish_core += 1
+    if technical.trend_label == "uptrend":
+        bullish_core += 1
+    if (mc.probability_up_20d or 0.0) >= 0.55:
+        bullish_core += 1
+    if final_score >= 85 and confidence >= 75 and neg_count <= 1 and technical.trend_label != "downtrend" and bullish_core >= 2:
+        return "HIGH CONVICTION BUY CANDIDATE"
+    if final_score >= 70 and technical.trend_label != "downtrend" and neg_count <= 2:
+        return "STRONG BUY CANDIDATE"
+    if final_score >= 55:
+        return "WATCHLIST / POSSIBLE BUY"
+    if final_score >= 40:
+        return "NEUTRAL / WAIT FOR BETTER ENTRY"
     return "AVOID / HIGH RISK"
 
 
-def confidence_from_components(news_count: int, final_score: float, negative_count: int, has_history: bool) -> float:
+def component_quality_adjustment(
+    news_score: float,
+    technical: TechnicalSnapshot,
+    fundamentals: FundamentalsSnapshot,
+    mc: MonteCarloSnapshot,
+    macro_score: float,
+    sector_macro_score: float,
+) -> Tuple[float, List[str]]:
+    signals = [
+        clamp(news_score / 100.0, -1.25, 1.25),
+        clamp(technical.score / 85.0, -1.0, 1.0),
+        clamp(fundamentals.score / 50.0, -1.0, 1.0),
+        clamp(mc.risk_score / 45.0, -1.0, 1.0),
+        clamp((macro_score + sector_macro_score) / 80.0, -0.90, 0.90),
+    ]
+    positive = sum(1 for value in signals if value > 0.18)
+    negative = sum(1 for value in signals if value < -0.18)
+    notes: List[str] = []
+    if positive >= 4 and negative == 0:
+        notes.append("Independent signals broadly agree to the upside.")
+        return 9.0, notes
+    if positive >= 3 and negative <= 1:
+        notes.append("Most independent signals agree to the upside.")
+        return 5.0, notes
+    if positive >= 2 and negative >= 2:
+        notes.append("Signals conflict, so confidence is reduced.")
+        return -8.0, notes
+    if negative >= 3:
+        notes.append("Multiple independent signals point to elevated downside risk.")
+        return -10.0, notes
+    return 0.0, notes
+
+
+def confidence_from_components(
+    news_count: int,
+    final_score: float,
+    negative_count: int,
+    has_history: bool,
+    quality_adjustment: float = 0.0,
+) -> float:
     confidence = 42.0 + min(news_count, 25) * 1.0 + max(min(final_score, 90), -40) * 0.35
     confidence -= negative_count * 3.8
     if has_history:
         confidence += 8.0
+    confidence += quality_adjustment * 0.55
     return max(5.0, min(93.0, confidence))
 
 
@@ -990,32 +1563,65 @@ def analyze_ticker(
         negative_hits,
     )
 
-    direct_negative_risk = sum(negative_hits.values()) * 7.0
-
-    final_score = (
-        news_score * 0.55
-        + technical.score * 0.20
-        + fundamentals.score * 0.12
-        + mc.risk_score * 0.13
-        + sector_macro_score
-        + macro_score * 0.22
-        - macro_risk_score * 0.08
-        - direct_negative_risk
+    final_score, risk_penalty, bullish_reasons, bearish_reasons = compute_probability_ranking_score(
+        news_score,
+        positive_hits,
+        negative_hits,
+        technical,
+        fundamentals,
+        mc,
+        macro_score,
+        macro_risk_score,
+        sector_macro_score,
     )
+    quality_adjustment, quality_notes = component_quality_adjustment(
+        news_score,
+        technical,
+        fundamentals,
+        mc,
+        macro_score,
+        sector_macro_score,
+    )
+    notes.extend(quality_notes)
+    if bullish_reasons:
+        notes.append("Bullish alignment: " + ", ".join(bullish_reasons[:5]) + ".")
+    if bearish_reasons:
+        notes.append("Risk alignment: " + ", ".join(bearish_reasons[:5]) + ".")
+    if risk_penalty > 25:
+        notes.append("Risk penalty is elevated, so ranking is conservative.")
 
     if technical.trend_label == "downtrend" and news_score < 45:
         final_score -= 14
         notes.append("Downtrend requires very strong positive news; extra penalty applied.")
     if technical.pullback_label == "extended / chased":
+        final_score -= 8
         notes.append("Price looks extended, so chasing risk is high.")
     if technical.pullback_label == "healthy pullback near moving average" and news_score > 20:
-        final_score += 8
+        final_score += 5
         notes.append("Positive news plus healthy pullback setup.")
+    final_score = clamp(final_score, 0.0, 100.0)
 
-    action = action_from_score(final_score, negative_hits, technical)
-    confidence = confidence_from_components(len(news), final_score, sum(negative_hits.values()), history is not None)
+    confidence = confidence_from_components(
+        len(news),
+        final_score,
+        sum(negative_hits.values()),
+        history is not None,
+        quality_adjustment,
+    )
+    setup_label = detect_rising_stock_setup(technical, news_score, negative_hits, mc, sector_macro_score)
+    small_score, small_risk, small_summary = small_cap_catalyst_score(
+        info,
+        sector,
+        technical,
+        positive_hits,
+        negative_hits,
+        news,
+    )
+    ranking_score = compute_ranking_score(final_score, confidence, setup_label, mc, technical, negative_hits)
+    estimated_upside_probability = prediction.probability_up_1w or prediction.probability_up_1d or mc.probability_up_20d
+    action = action_from_score(final_score, confidence, negative_hits, technical, news_score, mc)
 
-    return StockResult(
+    result = StockResult(
         ticker=ticker,
         company=company,
         sector=sector,
@@ -1029,12 +1635,28 @@ def analyze_ticker(
         monte_carlo=mc,
         fundamentals=fundamentals,
         prediction=prediction,
+        ranking_score=ranking_score,
+        rising_setup_label=setup_label,
+        estimated_upside_probability=estimated_upside_probability,
+        small_cap_catalyst_score=small_score,
+        small_cap_risk_level=small_risk,
+        small_cap_summary=small_summary,
+        suggested_entry_style=suggested_entry_style(setup_label, technical),
+        backtest=backtest_strategy(ticker, history),
         positive_hits=positive_hits,
         negative_hits=negative_hits,
-        headlines=sorted(news, key=lambda item: credibility_weight(item.source), reverse=True)[:8],
+        headlines=sorted(
+            news,
+            key=lambda item: (parse_news_datetime(item.published) or datetime.min.replace(tzinfo=timezone.utc), credibility_weight(item.source)),
+            reverse=True,
+        )[:8],
         notes=notes,
         history=history,
     )
+    result.recommendation_reason = generate_recommendation_reason(result)
+    result.main_risk_warning = main_risk_warning_from_components(result)
+    result.risk_management = risk_management_suggestion(result)
+    return result
 
 
 def discover_tickers_from_news(max_tickers: int = 80) -> List[str]:
@@ -1146,14 +1768,23 @@ def print_result(result: StockResult, rank: int) -> None:
     print(f"  Sector      : {result.sector}")
     print(f"  Confidence  : {result.confidence:.1f}%")
     print(f"  Final score : {result.final_score:.1f}")
+    print(f"  Ranking score: {result.ranking_score:.1f}")
+    print(f"  Rising setup : {result.rising_setup_label}")
+    est_prob = "N/A" if result.estimated_upside_probability is None else f"{result.estimated_upside_probability * 100:.1f}%"
+    print(f"  Est. upside probability: {est_prob}")
+    print(f"  Entry style  : {result.suggested_entry_style}")
 
     print("\nSCORE BREAKDOWN")
-    print(f"  News / catalyst       : {result.news_score:.1f}  (highest weight)")
+    print(f"  News catalyst         : {result.news_score:.1f}")
     print(f"  Technical / pullback  : {result.technical.score:.1f}")
+    print(f"  Trend quality         : {trend_quality_score(result.technical):.1f}")
+    print(f"  Volume activity       : {volume_activity_score(result.technical):.1f}")
     print(f"  Fundamentals / growth : {result.fundamentals.score:.1f}")
     print(f"  Monte Carlo risk      : {result.monte_carlo.risk_score:.1f}")
     print(f"  Live macro            : {result.macro_score:.1f}")
     print(f"  Sector macro          : {result.sector_macro_score:.1f}")
+    print(f"  Small-cap catalyst    : {result.small_cap_catalyst_score:.1f}")
+    print(f"  Small-cap risk level  : {result.small_cap_risk_level}")
 
     print("\nFORECAST")
     print("  Horizon | Predicted price | Expected return | Chance up")
@@ -1178,6 +1809,26 @@ def print_result(result: StockResult, rank: int) -> None:
     print("\nNEWS EVENTS")
     print("  Positive:", result.positive_hits or "none")
     print("  Negative:", result.negative_hits or "none")
+    print("\nWHY THIS STOCK?")
+    print(f"  {result.recommendation_reason}")
+    print("\nMAIN RISK WARNING")
+    print(f"  {result.main_risk_warning}")
+    if result.small_cap_summary != "N/A":
+        print("\nSMALL-CAP / CATALYST NOTE")
+        print(f"  {result.small_cap_summary}")
+    if result.risk_management:
+        print("\nRISK MANAGEMENT")
+        print(f"  Suggested stop-loss area : {result.risk_management.get('stopLossArea', 'N/A')}")
+        print(f"  Take-profit zone         : {result.risk_management.get('takeProfitZone', 'N/A')}")
+        print(f"  Position size level      : {result.risk_management.get('positionSize', 'N/A')}")
+        print(f"  Risk notes               : {result.risk_management.get('warnings', 'N/A')}")
+    if result.backtest.get("available"):
+        print("\nEDUCATIONAL BACKTEST")
+        print(f"  Trades          : {result.backtest.get('trades', 'N/A')}")
+        print(f"  Win rate        : {result.backtest.get('winRate', 0.0) * 100:.1f}%")
+        print(f"  Avg 20d return  : {result.backtest.get('averageReturn20d', 0.0) * 100:+.2f}%")
+        print(f"  Max drawdown    : {result.backtest.get('maxDrawdown', 0.0) * 100:.1f}%")
+        print(f"  Buy/hold return : {result.backtest.get('buyAndHoldReturn', 0.0) * 100:+.2f}%")
     if result.notes:
         print("\nNOTES")
         for note in result.notes[:4]:
@@ -1264,7 +1915,7 @@ def run() -> None:
         print("No valid results.")
         return
 
-    results.sort(key=lambda row: (row.final_score, row.confidence), reverse=True)
+    results.sort(key=lambda row: (row.ranking_score, row.final_score, row.confidence), reverse=True)
 
     print("\n" + "=" * 78)
     if mode == "1":
